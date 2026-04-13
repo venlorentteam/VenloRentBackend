@@ -8,6 +8,7 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
+      maxlength: 30,
     },
     email: {
       type: String,
@@ -15,6 +16,7 @@ const userSchema = new mongoose.Schema(
       unique: true,
       lowercase: true,
       trim: true,
+      maxlength: 50,
     },
     username: {
       type: String,
@@ -22,12 +24,35 @@ const userSchema = new mongoose.Schema(
       unique: true,
       lowercase: true,
       trim: true,
+      maxlength: 30,
+    },
+    phone: {
+      type: String,
+      trim: true,
+      default: "",
+      maxlength: 30,
+    },
+    bio: {
+      type: String,
+      maxlength: 100,
+      trim: true,
+      default: "",
+    },
+    avatar: {
+      type: String,
+      trim: true,
+      default: "",
     },
     // Password comes in plain text but is hashed in the pre-save hook below.
     password: {
       type: String,
       required: true,
       minlength: 6,
+    },
+    country: {
+      type: String,
+      trim: true,
+      default: "Nigeria",
     },
     emailVerified: {
       type: Boolean,
@@ -42,6 +67,14 @@ const userSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    resetPasswordToken: {
+      type: String,
+      default: null,
+    },
+    resetPasswordExpires: {
+      type: Date,
+      default: null,
+    },
     role: {
       type: String,
       enum: ['agent', 'regular'],
@@ -52,8 +85,24 @@ const userSchema = new mongoose.Schema(
       type: String,
       enum: ['free', 'pro', 'premium'],
       default: 'free',
-      required: true,
-
+    },
+    // KYC summary fields live on the user to make gating simple (UI/authorization).
+    // Detailed KYC records live in the KycSubmission collection.
+    kycStatus: {
+      type: String,
+      enum: ['unsubmitted', 'submitted', 'in_review', 'verified', 'rejected'],
+      default: 'unsubmitted',
+    },
+    // Points to the most recent KYC submission (optional).
+    kycCurrentSubmission: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "KycSubmission",
+      default: null,
+    },
+    // Timestamp of when the user was verified (if applicable).
+    kycVerifiedAt: {
+      type: Date,
+      default: null,
     }
   },
   {

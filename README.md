@@ -1,2 +1,2 @@
 # NewProjectBackend
-The Backend for the NewProject which should contain routes and API calls
+The Backend for the Venlorent which should contain routes and API calls
