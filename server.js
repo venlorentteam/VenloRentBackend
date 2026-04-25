@@ -11,7 +11,8 @@ const PORT = process.env.PORT || 4000
 app.use(cors())
 app.use("/auth/kyc/didit-webhook", express.raw({ type: "application/json" })) // raw body required for HMAC verification in KYC webhook
 // Raw body parsing is required to be placed before the general JSON parser, otherwise the webhook signature verification will fail due to altered request body.
-app.use(express.json())
+app.use(express.json({ limit: "50mb" }))
+app.use(express.urlencoded({ limit: "50mb", extended: true }))
 app.use("/", apiRoutes)
 
 // Start the server only after database connection succeeds.

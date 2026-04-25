@@ -10,7 +10,7 @@ const reportSchema = new mongoose.Schema(
     },
     targetType: {
       type: String,
-      enum: ["user", "property", "message", "order"],
+      enum: ["user", "property", "request", "message", "order"],
       required: true,
       index: true,
     },
@@ -34,7 +34,7 @@ const reportSchema = new mongoose.Schema(
     details: {
       type: String,
       trim: true,
-      maxlength: 2000,
+      maxlength: 300,
       default: "",
     },
     status: {

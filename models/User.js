@@ -86,6 +86,12 @@ const userSchema = new mongoose.Schema(
       enum: ['free', 'pro', 'premium'],
       default: 'free',
     },
+    status: {
+      type: String,
+      enum: ['active', 'suspended', 'deactivated'],
+      default: "active",
+      index: true,
+    },
     // KYC summary fields live on the user to make gating simple (UI/authorization).
     // Detailed KYC records live in the KycSubmission collection.
     kycStatus: {

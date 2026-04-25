@@ -15,10 +15,12 @@ const Discussion = require("./models/Discussion")
 const KycSubmission = require("./models/KycSubmission")
 const Order = require("./models/Order")
 const Follow = require("./models/Follow")
+const Report = require("./models/Report")
 const Conversation = require("./models/Conversation")
 const Message = require("./models/Messages")
 const authMiddleware = require("./middleware/authMiddleware") //Token decrypter and userID extractor 
 const Notification = require("./models/Notification")
+
 // Helpers
 const notify = require("./utility/notify")
 const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail } = require("./emails")
@@ -139,8 +141,8 @@ router.post("/auth/register", registerLimiter, async (req, res) => {
       errors.username = "Username can only contain letters, numbers, and underscores"
     }
 
-    if (passwordText.length < 8) {
-      errors.password = "Password must be at least 8 characters"
+    if (passwordText.length < 6) {
+      errors.password = "Password must be at least 6 characters"
     } else if (!/^(?=.*[A-Za-z])(?=.*\d)(?=.*[^A-Za-z0-9]).+$/.test(passwordText)) {
       errors.password = "Password must contain at least one letter, one number, and one special character"
     }
@@ -220,7 +222,7 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
     // Compare provided password with hashed password in DB using the model's comparePassword method.
     const isPasswordValid = await user.comparePassword(password)
     if (!isPasswordValid) {
-      return res.status(401).json({ message: "Invalid credentials" })
+      return res.status(401).json({ message: "Incorrect email or password" })
     }
 
     if (!user.emailVerified){
@@ -244,6 +246,10 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
 
       return res.status(400).json({isEmailVerified: false, message: "Please verify your email. A new OTP has been sent"})
     }
+
+    if (user.status !== "active") {
+      return res.status(403).json({ message: `Your account is currently ${user.status}. Please contact support for assistance.` })
+    }
     
     //Generate JWT token
     const token = jwt.sign(
@@ -259,9 +265,11 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
       username: user.username,
       phone: user.phone,
       bio: user.bio,
+      country: user.country,
       avatar: user.avatar,
       emailVerified: user.emailVerified,
       kycStatus: user.kycStatus,
+      plan: user.plan,
     }
     return res.status(200).json({
       message: "Login successful",
@@ -918,8 +926,17 @@ router.post("/auth/kyc/submit-documents", authMiddleware, kycUploadMiddleware, a
       }
     )
 
-    // Didit responds with a real, hosted verification URL
-    const { verification_url, session_id } = diditResponse.data
+    console.log("Didit response:", JSON.stringify(diditResponse.data, null, 2)) // Log the full response for debugging, remove in production
+
+    const { url: verification_url, session_id } = diditResponse.data
+
+    // Guard for missing URL 
+    if (!verification_url) {
+      return res.status(502).json({
+        message: "Didit session created but no verification URL was returned",
+        diditResponse: diditResponse.data,  // helpful for debugging, remove in production
+      })
+    }
 
     // Save the real URL and session ID to your submission record
     submission.diditUrl = verification_url
@@ -1393,25 +1410,39 @@ router.post("/properties/:id/comments", authMiddleware, async (req, res) => {
   }
 })
 
-// Report a property (protected)
+// POST /properties/:id/report
 router.post("/properties/:id/report", authMiddleware, async (req, res) => {
   try {
-    const { reason } = req.body
+    const { reason, details = "" } = req.body
 
-    if (!reason || !reason.toString().trim()) {
-      return res.status(400).json({ message: "reason is required" })
+    const validReasons = ["spam", "fraud", "harassment", "fake_listing", "inappropriate_content", "other"]
+    if (!reason || !validReasons.includes(reason)) {
+      return res.status(400).json({ message: "A valid report reason is required" })
     }
 
-    const property = await Property.findById(req.params.id)
+    if (details && details.length > 300) {
+      return res.status(400).json({ message: "Report details exceed the maximum length of 300 characters" })
+    }
 
+    const property = await Property.findById(req.params.id).select("owner reportsCount moderationStatus moderationReasons")
     if (!property) {
       return res.status(404).json({ message: "Property not found" })
     }
 
-    // Step 2: post-publish monitoring.
+    if (property.owner.toString() === req.user.id) {
+      return res.status(400).json({ message: "You cannot report your own listing" })
+    }
+
+    await Report.create({
+      reporter: req.user.id,
+      targetType: "property",
+      targetId: property._id,
+      reason,
+      details: details.toString().trim().slice(0, 300),
+    })
+
     property.reportsCount = Number(property.reportsCount || 0) + 1
 
-    // Auto-flag when reports cross threshold.
     if (property.reportsCount >= 3 && property.moderationStatus === "approved") {
       property.moderationStatus = "flagged"
       property.moderationReasons = [
@@ -1424,7 +1455,7 @@ router.post("/properties/:id/report", authMiddleware, async (req, res) => {
 
     return res.status(200).json({ success: true, message: "Report submitted" })
   } catch (error) {
-    return res.status(500).json({ message: "Failed to report property", error: error.message })
+    return res.status(500).json({ message: "Failed to submit report", error: error.message })
   }
 })
 
@@ -2496,6 +2527,106 @@ router.delete("/notifications/:id", authMiddleware, async (req, res) => {
     return res.status(200).json({ success: true, message: "Notification deleted" })
   } catch (error) {
     return res.status(500).json({ message: "Failed to delete notification", error: error.message })
+  }
+})
+
+// DELETE /properties/:id (owner only)
+router.delete("/properties/:id", authMiddleware, async (req, res) => {
+  try {
+    const property = await Property.findById(req.params.id).select("owner media")
+    if (!property) {
+      return res.status(404).json({ message: "Property not found" })
+    }
+    if (property.owner.toString() !== req.user.id) {
+      return res.status(403).json({ message: "You can only delete your own listings" })
+    }
+
+    // Delete all media from Cloudinary before removing the DB record
+    if (property.media?.length > 0) {
+      await Promise.allSettled(
+        property.media.map((m) =>
+          cloudinary.uploader.destroy(m.publicId, {
+            resource_type: m.resourceType || "image",
+          })
+        )
+      )
+    }
+
+    await Property.findByIdAndDelete(req.params.id)
+
+    // Clean up related data
+    await Promise.allSettled([
+      Comment.deleteMany({ property: req.params.id }),
+      Bookmark.deleteMany({ targetType: "Property", targetId: req.params.id }),
+    ])
+
+    return res.status(200).json({ success: true, message: "Listing deleted successfully" })
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to delete listing", error: error.message })
+  }
+})
+
+// DELETE /requests/:id (owner only)
+router.delete("/requests/:id", authMiddleware, async (req, res) => {
+  try {
+    const request = await Request.findById(req.params.id).select("requester")
+    if (!request) {
+      return res.status(404).json({ message: "Request not found" })
+    }
+    if (request.requester.toString() !== req.user.id) {
+      return res.status(403).json({ message: "You can only delete your own requests" })
+    }
+
+    await Request.findByIdAndDelete(req.params.id)
+
+    // Clean up related data
+    await Promise.allSettled([
+      Discussion.deleteMany({ request: req.params.id }),
+      RequestResponse.deleteMany({ request: req.params.id }),
+      Bookmark.deleteMany({ targetType: "Request", targetId: req.params.id }),
+    ])
+
+    return res.status(200).json({ success: true, message: "Request deleted successfully" })
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to delete request", error: error.message })
+  }
+})
+
+// POST /requests/:id/report
+router.post("/requests/:id/report", authMiddleware, async (req, res) => {
+  try {
+    const { reason, details = "" } = req.body
+
+    const validReasons = ["spam", "fraud", "harassment", "fake_listing", "inappropriate_content", "other"]
+    if (!reason || !validReasons.includes(reason)) {
+      return res.status(400).json({ message: "A valid report reason is required" })
+    }
+
+    if (details && details.length > 300) {
+      return res.status(400).json({ message: "Report details exceed the maximum length of 300 characters" })
+    }
+    
+    const request = await Request.findById(req.params.id).select("requester")
+    if (!request) {
+      return res.status(404).json({ message: "Request not found" })
+    }
+
+    if (request.requester.toString() === req.user.id) {
+      return res.status(400).json({ message: "You cannot report your own request" })
+    }
+
+    // Request schema has no reportsCount or reports array — only create the Report document
+    await Report.create({
+      reporter: req.user.id,
+      targetType: "request", 
+      targetId: request._id,
+      reason,
+      details: details.toString().trim().slice(0, 300),
+    })
+
+    return res.status(200).json({ success: true, message: "Report submitted" })
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to submit report", error: error.message })
   }
 })
 

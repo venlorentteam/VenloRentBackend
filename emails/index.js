@@ -1,9 +1,9 @@
 const { Resend } = require("resend")
 
-// ─────────────────────────────────────────────────────────────
+// ==========================================================
 // Brand tokens — single source of truth for all email styles.
 // Matches the VenloRent design system (emerald-500 primary).
-// ─────────────────────────────────────────────────────────────
+// ==========================================================
 const B = {
   name: "VenloRent",
   primary: "#059669", // emerald-600
@@ -151,7 +151,7 @@ const renderOtpEmail = (otp) => shell(`
   </table>
 
   ${divider}
-  ${note("Didn't request this? You can safely ignore this email — your account won't be affected.<br/>Never share this code with anyone, including ${B.name} support.")}
+  ${note(`Didn't request this? You can safely ignore this email — your account won't be affected.<br/>Never share this code with anyone, including ${B.name} support.`)}
 `)
 
 // =========================================================

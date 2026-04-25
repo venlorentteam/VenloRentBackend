@@ -12,7 +12,7 @@ cloudinary.config({
   api_key:    process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 })
-// --- Avatar upload (public, auto-cropped to face) ---
+// === Avatar upload (public, auto-cropped to face) ===
 const avatarStorage = new CloudinaryStorage({
   cloudinary,
   params: {
@@ -24,7 +24,7 @@ const avatarStorage = new CloudinaryStorage({
 
 const avatarUpload = multer({
   storage: avatarStorage,
-  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
   fileFilter: (req, file, cb) => {
     const allowed = ["image/jpeg", "image/png", "image/webp", "image/jpg"]
     if (!allowed.includes(file.mimetype)) {
@@ -64,32 +64,30 @@ const listingStorage = new CloudinaryStorage({
   params: async (req, file) => {
     const isImage = file.mimetype.startsWith("image/")
     const isVideo = file.mimetype.startsWith("video/")
-    return{
-      folder: "listing-media",
-      resource_type: "auto", // allows images + videos
-      public_id: `${req.user.id}_${Date.now()}_${file.originalname}`,
 
-      // Image transformations (max width + auto quality + auto format)
+    return {
+      folder: "listing-media",
+      resource_type: isVideo ? "video" : "image",  // ← explicit, never "auto"
+      public_id: `${req.user.id}_${Date.now()}_${file.fieldname}`, // ← also changed originalname to fieldname to avoid special chars breaking the public_id
+
       ...(isImage && {
         transformation: [
           { width: 1600, crop: "limit" },
           { quality: "auto", fetch_format: "auto" },
         ],
-        // Create a thumbnail variant
         eager: [
           { width: 500, height: 500, crop: "fill", quality: "auto", fetch_format: "auto" },
         ],
         eager_async: true,
       }),
 
-      // Video transformation 
       ...(isVideo && {
         transformation: [
-          { width: 1280, crop: "limit" }, // max width for videos
-          { quality: "auto", fetch_format: "auto" },
-          { duration: 30 } // cap length to 30s (optional)
-        ]
-      })
+          { width: 1280, crop: "limit" },
+          { quality: "auto" },
+          { duration: 30 },
+        ],
+      }),
     }
   }
 })
