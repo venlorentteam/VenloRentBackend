@@ -27,6 +27,8 @@ const reportSchema = new mongoose.Schema(
         "harassment",
         "fake_listing",
         "inappropriate_content",
+        "off_platform_contact",
+        "abusive_language",
         "other",
       ],
       required: true,

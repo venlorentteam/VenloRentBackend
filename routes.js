@@ -44,6 +44,17 @@ const requestSnapshot = (r) => ({
   location: [r.location?.town, r.location?.state].filter(Boolean).join(", "),
 })
 
+// Returns true when `userDoc` has blocked `otherUserId`.
+const hasBlockedUser = (userDoc, otherUserId) =>
+  Array.isArray(userDoc?.blockedUsers) &&
+  userDoc.blockedUsers.some((id) => String(id) === String(otherUserId))
+
+// Resolve the "other person" in a 1-to-1 conversation.
+const getConversationPartnerId = (conversation, userId) =>
+  conversation?.participants?.find((p) => String(p?._id || p) !== String(userId))?._id?.toString?.() ||
+  conversation?.participants?.find((p) => String(p?._id || p) !== String(userId))?.toString?.() ||
+  null
+
 // Dedicated upload middleware so multer errors return predictable JSON messages.
 const kycUploadMiddleware = (req, res, next) => {
   const handler = kycUpload.fields([{ name: "addressProof", maxCount: 1 }])
@@ -1231,7 +1242,7 @@ router.get("/properties", async (req, res) => {
 
     const { category, status, minAmount, maxAmount, page = 1, limit = 20 } = req.query
 
-    // Show approved properties; also include docs where moderationStatus doesn't exist yet.
+    // Show approved properties
     const query = {
       $or: [
         { moderationStatus: "approved" },
@@ -1433,6 +1444,16 @@ router.post("/properties/:id/report", authMiddleware, async (req, res) => {
       return res.status(400).json({ message: "You cannot report your own listing" })
     }
 
+    const alreadyReported = await Report.exists({
+      reporter: req.user.id,
+      targetType: "property",
+      targetId: property._id,
+    })
+
+    if (alreadyReported) {
+      return res.status(409).json({ message: "You have already reported this listing" })
+    }
+    
     await Report.create({
       reporter: req.user.id,
       targetType: "property",
@@ -1443,7 +1464,7 @@ router.post("/properties/:id/report", authMiddleware, async (req, res) => {
 
     property.reportsCount = Number(property.reportsCount || 0) + 1
 
-    if (property.reportsCount >= 3 && property.moderationStatus === "approved") {
+    if (property.reportsCount >= 5 && property.moderationStatus === "approved") {
       property.moderationStatus = "flagged"
       property.moderationReasons = [
         ...(property.moderationReasons || []),
@@ -2293,13 +2314,27 @@ router.get("/bookmarks", authMiddleware, async (req, res) => {
  ============================================*/
  router.get("/conversations", authMiddleware, async (req, res) => {
   try {
+    const me = await User.findById(req.user.id).select("blockedUsers")
     const conversations = await Conversation.find({
       participants: req.user.id,
     })
       .sort({ lastMessageAt: -1 }) // most recently active first
-      .populate("participants", "fullName username avatar kycStatus plan")
+      .populate("participants", "fullName username avatar kycStatus plan blockedUsers")
 
-    return res.status(200).json({ success: true, conversations })
+    // Hide conversations that are blocked in either direction.
+    const visibleConversations = conversations.filter((conversation) => {
+      const otherUserId = getConversationPartnerId(conversation, req.user.id)
+      if (!otherUserId) return false
+
+      const other = conversation.participants.find((p) => String(p._id) === String(otherUserId))
+      if (!other) return false
+
+      const blockedByMe = hasBlockedUser(me, otherUserId)
+      const blockedByThem = hasBlockedUser(other, req.user.id)
+      return !blockedByMe && !blockedByThem
+    })
+
+    return res.status(200).json({ success: true, conversations: visibleConversations })
   } catch (error) {
     return res.status(500).json({ message: "Failed to fetch conversations", error: error.message })
   }
@@ -2321,9 +2356,18 @@ router.post("/conversations", authMiddleware, async (req, res) => {
       return res.status(400).json({ message: "You cannot message yourself" })
     }
 
-    const recipient = await User.findById(recipientId).select("_id")
+    const [me, recipient] = await Promise.all([
+      User.findById(req.user.id).select("blockedUsers"),
+      User.findById(recipientId).select("_id blockedUsers"),
+    ])
+
     if (!recipient) {
       return res.status(404).json({ message: "Recipient not found" })
+    }
+
+    // Respect block lists in both directions before creating a thread.
+    if (hasBlockedUser(me, recipientId) || hasBlockedUser(recipient, req.user.id)) {
+      return res.status(403).json({ message: "You cannot start a conversation with this user" })
     }
 
     // Sort participant IDs so the unique index is order-independent.
@@ -2358,6 +2402,16 @@ router.get("/conversations/:id/messages", authMiddleware, async (req, res) => {
     const isMember = conversation.participants.some((p) => p.equals(req.user.id))
     if (!isMember) {
       return res.status(403).json({ message: "Access denied" })
+    }
+
+    const partnerId = getConversationPartnerId(conversation, req.user.id)
+    const [me, partner] = await Promise.all([
+      User.findById(req.user.id).select("blockedUsers"),
+      partnerId ? User.findById(partnerId).select("blockedUsers") : null,
+    ])
+
+    if (hasBlockedUser(me, partnerId) || hasBlockedUser(partner, req.user.id)) {
+      return res.status(403).json({ message: "This conversation is blocked" })
     }
 
     const { page = 1, limit = 50 } = req.query
@@ -2409,6 +2463,16 @@ router.post("/conversations/:id/messages", authMiddleware, async (req, res) => {
       return res.status(403).json({ message: "Access denied" })
     }
 
+    const partnerId = getConversationPartnerId(conversation, req.user.id)
+    const [me, partner] = await Promise.all([
+      User.findById(req.user.id).select("blockedUsers"),
+      partnerId ? User.findById(partnerId).select("blockedUsers") : null,
+    ])
+
+    if (hasBlockedUser(me, partnerId) || hasBlockedUser(partner, req.user.id)) {
+      return res.status(403).json({ message: "This conversation is blocked" })
+    }
+
     // Persist the message.
     const message = await Message.create({
       conversation: conversation._id,
@@ -2436,6 +2500,116 @@ router.post("/conversations/:id/messages", authMiddleware, async (req, res) => {
     return res.status(201).json({ success: true, message: populated })
   } catch (error) {
     return res.status(500).json({ message: "Failed to send message", error: error.message })
+  }
+})
+
+/* =========================================================
+ * POST /USERS/:ID/BLOCK
+ * Blocks another user for the current account.
+ * The block is persisted on the current user's document and
+ * enforced on conversations/message routes.
+ * =========================================================*/
+router.post("/users/:id/block", authMiddleware, async (req, res) => {
+  try {
+    const targetId = req.params.id
+
+    if (!targetId) {
+      return res.status(400).json({ message: "Target user id is required" })
+    }
+
+    if (String(targetId) === String(req.user.id)) {
+      return res.status(400).json({ message: "You cannot block yourself" })
+    }
+
+    const targetUser = await User.findById(targetId).select("_id")
+    if (!targetUser) {
+      return res.status(404).json({ message: "User not found" })
+    }
+
+    const currentUser = await User.findById(req.user.id).select("blockedUsers")
+    if (!currentUser) {
+      return res.status(404).json({ message: "Current user not found" })
+    }
+
+    // Use $addToSet so the operation is safe to repeat without duplicates.
+    const alreadyBlocked = hasBlockedUser(currentUser, targetId)
+    if (!alreadyBlocked) {
+      await User.updateOne(
+        { _id: req.user.id },
+        { $addToSet: { blockedUsers: targetUser._id } }
+      )
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: alreadyBlocked ? "User already blocked" : "User blocked",
+      blocked: true,
+      targetId,
+    })
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to block user", error: error.message })
+  }
+})
+
+/* =========================================================
+ * POST /REPORTS
+ * Generic report endpoint for chat/message reports.
+ * The frontend sends targetType="message" with a conversation id.
+ * =========================================================*/
+router.post("/reports", authMiddleware, async (req, res) => {
+  try {
+    const { targetType, targetId, reason, details = "" } = req.body
+
+    const validTargetTypes = ["message"]
+    const validReasons = [
+      "spam",
+      "fraud",
+      "harassment",
+      "inappropriate_content",
+      "off_platform_contact",
+      "abusive_language",
+      "other",
+    ]
+
+    if (!targetType || !validTargetTypes.includes(targetType)) {
+      return res.status(400).json({ message: "A valid report targetType is required" })
+    }
+
+    if (!targetId) {
+      return res.status(400).json({ message: "A targetId is required" })
+    }
+
+    if (!reason || !validReasons.includes(reason)) {
+      return res.status(400).json({ message: "A valid report reason is required" })
+    }
+
+    if (details && details.length > 300) {
+      return res.status(400).json({ message: "Report details exceed the maximum length of 300 characters" })
+    }
+
+    if (targetType === "message") {
+      const conversation = await Conversation.findById(targetId).select("participants")
+      if (!conversation) {
+        return res.status(404).json({ message: "Conversation not found" })
+      }
+
+      const isMember = conversation.participants.some((p) => p.equals(req.user.id))
+      if (!isMember) {
+        return res.status(403).json({ message: "You cannot report a conversation you are not part of" })
+      }
+    }
+
+    await Report.create({
+      reporter: req.user.id,
+      targetType,
+      targetId,
+      reason,
+      details: details.toString().trim().slice(0, 300),
+    })
+
+    return res.status(200).json({ success: true, message: "Report submitted" })
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to submit report", error: error.message })
   }
 })
 

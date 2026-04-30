@@ -109,7 +109,13 @@ const userSchema = new mongoose.Schema(
     kycVerifiedAt: {
       type: Date,
       default: null,
-    }
+    },
+    // Users this account has blocked. Blocking is enforced server-side so
+    // blocked chats cannot be re-opened or used to send new messages.
+    blockedUsers: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+      default: [],
+    },
   },
   {
     // Automatically adds createdAt and updatedAt fields.
