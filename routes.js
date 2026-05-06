@@ -22,7 +22,8 @@ const authMiddleware = require("./middleware/authMiddleware") //Token decrypter 
 const Notification = require("./models/Notification")
 
 // Helpers
-const notify = require("./utility/notify")
+const notify = require("./utility/orderLifecycle.js")
+const { expireOverdueOrders } = require("./utility/notify")
 const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail } = require("./emails")
 const { loginLimiter, otpLimiter, verifyLimiter, registerLimiter, passwordResetLimiter } = require('./utility/rateLimiters')
 const { cloudinary, avatarUpload, kycUpload, listingUpload } = require("./utility/cloudinary");
@@ -108,6 +109,87 @@ const checkContentModeration = ({ title = "", description = "" }) => {
     reasons: hits.map((term) => `Banned phrase detected: "${term}"`),
   }
 }
+
+// ================================================================
+// Order lifecycle helpers
+// Keep property availability and order status aligned in one place.
+// ================================================================
+// const ORDER_WINDOW_HOURS = 72
+// const ACTIVE_ORDER_STATUSES = new Set(["pending", "accepted"])
+// const TERMINAL_ORDER_STATUSES = new Set(["cancelled", "rejected", "completed"])
+
+// const normalizeOrderStatus = (value = "") => normalize(value)
+
+// const getPropertyStatusForOrder = (orderStatus, listingType = "") => {
+//   const status = normalizeOrderStatus(orderStatus)
+//   const type = normalize(listingType)
+
+//   if (status === "cancelled" || status === "rejected") {
+//     return "available"
+//   }
+
+//   if (status === "completed") {
+//     return type === "sale" ? "archived" : "rented"
+//   }
+
+//   if (status === "pending" || status === "accepted" || status === "pending_proof") {
+//     return "reserved"
+//   }
+
+//   return null
+// }
+
+// const orderSnapshot = (order) => {
+//   const property = order?.property || {}
+//   return {
+//     title: property.title || "",
+//     price: property.amount ? `â‚¦${Number(property.amount).toLocaleString("en-NG")}` : "",
+//     image: property.media?.[0]?.url || "",
+//     location: [property.location?.town, property.location?.state].filter(Boolean).join(", "),
+//   }
+// }
+
+// const syncPropertyStatusFromOrder = async (order, nextStatus) => {
+//   const propertyId = order?.property?._id || order?.property
+//   if (!propertyId) return null
+
+//   const listingType = order?.property?.listing_type || ""
+//   const propertyStatus = getPropertyStatusForOrder(nextStatus, listingType)
+//   if (!propertyStatus) return null
+
+//   await Property.findByIdAndUpdate(propertyId, { status: propertyStatus })
+//   return propertyStatus
+// }
+
+// const expireOverdueOrders = async () => {
+//   const now = new Date()
+//   const overdueOrders = await Order.find({
+//     status: { $in: ["pending", "accepted"] },
+//     expiresAt: { $lte: now },
+//   }).populate("property", "title amount listing_type location media")
+
+//   for (const order of overdueOrders) {
+//     if (TERMINAL_ORDER_STATUSES.has(normalizeOrderStatus(order.status))) continue
+
+//     order.status = "cancelled"
+//     if (["unpaid", "pending_proof"].includes(normalizeOrderStatus(order.paymentStatus))) {
+//       order.paymentStatus = "failed"
+//     }
+//     await order.save()
+//     await syncPropertyStatusFromOrder(order, "cancelled")
+
+//     if (order.buyer) {
+//       await notify({
+//         recipient: order.buyer,
+//         sender: order.seller || null,
+//         type: "order_cancelled",
+//         targetType: "Order",
+//         targetId: order._id,
+//         snapshot: orderSnapshot(order),
+//       })
+//     }
+//   }
+// }
 
 // Health check route
 router.get("/", async (req, res) => {
@@ -605,7 +687,7 @@ router.post('/auth/password-recovery', passwordResetLimiter, async (req, res) =>
     await user.save()
 
     // The raw token goes in the URL — never the hashed one
-    const resetUrl = `${process.env.APP_URL}/reset-password?token=${rawToken}`
+    const resetUrl = `${process.env.APP_URL}/password-reset?token=${rawToken}`
 
     const resend = getResendClient()
     await resend.emails.send({
@@ -836,6 +918,76 @@ router.patch('/edit-account', authMiddleware, avatarUpload.single("avatar"), asy
     }
     return res.status(500).json({
       message: "Failed to edit account",
+      error: error.message,
+    })
+  }
+})
+
+// Agent-only payout details update.
+router.patch("/payment-details", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user?.id
+    const user = await User.findById(userId).select("role payoutDetails")
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" })
+    }
+
+    if (user.role !== "agent") {
+      return res.status(403).json({ message: "Only agents can manage payment details" })
+    }
+
+    const {
+      bankName = "",
+      accountName = "",
+      accountNumber = "",
+      bankCode = "",
+      payoutMethod = "bank_transfer",
+    } = req.body
+
+    const trimmedBankName = bankName.toString().trim()
+    const trimmedAccountName = accountName.toString().trim()
+    const trimmedAccountNumber = accountNumber.toString().trim()
+    const trimmedBankCode = bankCode.toString().trim()
+    const normalizedMethod = payoutMethod.toString().trim().toLowerCase()
+
+    const errors = {}
+    if (!trimmedBankName) errors.bankName = "Bank name is required"
+    if (!trimmedAccountName) errors.accountName = "Account name is required"
+    if (!trimmedAccountNumber) errors.accountNumber = "Account number is required"
+    else if (!/^\d{8,14}$/.test(trimmedAccountNumber)) errors.accountNumber = "Account number must be 8-14 digits"
+
+    const allowedMethods = new Set(["bank_transfer", "wallet", "other"])
+    if (!allowedMethods.has(normalizedMethod)) {
+      errors.payoutMethod = "Invalid payout method"
+    }
+
+    if (Object.keys(errors).length > 0) {
+      return res.status(400).json({ message: "Validation failed", errors })
+    }
+
+    user.payoutDetails = {
+      bankName: trimmedBankName,
+      accountName: trimmedAccountName,
+      accountNumber: trimmedAccountNumber,
+      bankCode: trimmedBankCode,
+      payoutMethod: normalizedMethod,
+      verified: false,
+      updatedAt: new Date(),
+    }
+
+    await user.save()
+
+    const updatedUser = await User.findById(userId).select("-password -otp -otpExpires -resetPasswordToken -resetPasswordExpires")
+
+    return res.status(200).json({
+      success: true,
+      message: "Payment details updated successfully",
+      user: updatedUser,
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to update payment details",
       error: error.message,
     })
   }
@@ -1789,6 +1941,12 @@ router.post("/requests/:id/discussions", authMiddleware, async (req, res) => {
 // List orders for the current user (protected)
 router.get("/orders", authMiddleware, async (req, res) => {
   try {
+    try {
+      await expireOverdueOrders()
+    } catch (expireErr) {
+      console.error("Failed to expire overdue orders:", expireErr)
+    }
+
     const { status, role } = req.query
 
     const baseFilter =
@@ -1823,15 +1981,29 @@ router.post("/orders", authMiddleware, async (req, res) => {
       return res.status(400).json({ message: "propertyId is required" })
     }
 
-    const property = await Property.findById(propertyId).select("owner amount commission")
+    await expireOverdueOrders()
+
+    const property = await Property.findById(propertyId).select("owner amount commission listing_type status")
     if (!property) {
       return res.status(404).json({ message: "Property not found" })
     }
     if (property.owner.toString() === req.user.id) {
       return res.status(400).json({ message: "You cannot order your own listing" })
     }
+    if (normalize(property.status) !== "available") {
+      return res.status(409).json({ message: "Property is not available for a new order" })
+    }
 
-    const expiresAt = new Date(Date.now() + 72 * 60 * 60 * 1000)
+    const existingActiveOrder = await Order.exists({
+      property: property._id,
+      status: { $in: ["pending", "accepted"] },
+      expiresAt: { $gt: new Date() },
+    })
+    if (existingActiveOrder) {
+      return res.status(409).json({ message: "This property already has an active order" })
+    }
+
+    const expiresAt = new Date(Date.now() + ORDER_WINDOW_HOURS * 60 * 60 * 1000)
 
     const order = await Order.create({
       property: property._id,
@@ -1841,6 +2013,8 @@ router.post("/orders", authMiddleware, async (req, res) => {
       note: note.toString().trim(),
       expiresAt,
     })
+
+    await Property.findByIdAndUpdate(property._id, { status: "reserved" })
 
     await notify({// Send notification to seller about new order.
       recipient: property.owner,   // the seller
@@ -1859,6 +2033,150 @@ router.post("/orders", authMiddleware, async (req, res) => {
     return res.status(201).json({ success: true, order })
   } catch (error) {
     return res.status(500).json({ message: "Failed to create order", error: error.message })
+  }
+})
+
+// Update an order status (protected)
+router.patch("/orders/:orderId/status", authMiddleware, async (req, res) => {
+  try {
+    const { status: nextStatusRaw, paymentStatus: nextPaymentStatusRaw, note = "" } = req.body
+    const nextStatus = nextStatusRaw ? normalizeOrderStatus(nextStatusRaw) : ""
+    const nextPaymentStatus = nextPaymentStatusRaw ? normalizeOrderStatus(nextPaymentStatusRaw) : ""
+
+    if (!nextStatus && !nextPaymentStatus) {
+      return res.status(400).json({ message: "status or paymentStatus is required" })
+    }
+
+    const validStatuses = new Set(["accepted", "rejected", "completed", "cancelled"])
+    const validPaymentStatuses = new Set(["unpaid", "pending_proof", "paid", "failed", "refunded", "disputed"])
+
+    if (nextStatus && !validStatuses.has(nextStatus)) {
+      return res.status(400).json({ message: "Invalid order status" })
+    }
+    if (nextPaymentStatus && !validPaymentStatuses.has(nextPaymentStatus)) {
+      return res.status(400).json({ message: "Invalid payment status" })
+    }
+
+    const order = await Order.findById(req.params.orderId)
+      .populate("property", "title amount commission listing_type location media status owner")
+      .populate("buyer", "fullName username avatar")
+      .populate("seller", "fullName username avatar")
+
+    if (!order) {
+      return res.status(404).json({ message: "Order not found" })
+    }
+
+    const now = Date.now()
+    const expiresAt = order.expiresAt ? new Date(order.expiresAt).getTime() : null
+    const isExpired = expiresAt && now > expiresAt && !TERMINAL_ORDER_STATUSES.has(normalizeOrderStatus(order.status))
+
+    if (isExpired) {
+      order.status = "cancelled"
+      if (["unpaid", "pending_proof"].includes(normalizeOrderStatus(order.paymentStatus))) {
+        order.paymentStatus = "failed"
+      }
+      await order.save()
+      await syncPropertyStatusFromOrder(order, "cancelled")
+      await notify({
+        recipient: order.buyer,
+        sender: order.seller,
+        type: "order_cancelled",
+        targetType: "Order",
+        targetId: order._id,
+        snapshot: orderSnapshot(order),
+      })
+      if (order.seller) {
+        await notify({
+          recipient: order.seller,
+          sender: order.buyer,
+          type: "order_cancelled",
+          targetType: "Order",
+          targetId: order._id,
+          snapshot: orderSnapshot(order),
+        })
+      }
+      return res.status(409).json({ message: "Order has expired" })
+    }
+
+    const requesterId = String(req.user.id)
+    const buyerId = String(order.buyer?._id || order.buyer)
+    const sellerId = String(order.seller?._id || order.seller)
+    const isBuyer = requesterId === buyerId
+    const isSeller = requesterId === sellerId
+
+    if (!isBuyer && !isSeller) {
+      return res.status(403).json({ message: "You are not allowed to update this order" })
+    }
+
+    if (nextStatus === "accepted" || nextStatus === "rejected" || nextStatus === "completed") {
+      if (!isSeller) {
+        return res.status(403).json({ message: "Only the seller can approve or complete this order" })
+      }
+    }
+
+    if (nextStatus === "cancelled") {
+      if (!isBuyer && !isSeller) {
+        return res.status(403).json({ message: "You are not allowed to cancel this order" })
+      }
+    }
+
+    if (note.toString().trim()) {
+      order.note = note.toString().trim()
+    }
+
+    if (nextStatus) {
+      order.status = nextStatus
+      await syncPropertyStatusFromOrder(order, nextStatus)
+
+      if (nextStatus === "accepted") {
+        await notify({
+          recipient: order.buyer,
+          sender: order.seller,
+          type: "order_accepted",
+          targetType: "Order",
+          targetId: order._id,
+          snapshot: orderSnapshot(order),
+        })
+      }
+
+      if (nextStatus === "cancelled" || nextStatus === "rejected") {
+        await notify({
+          recipient: order.buyer,
+          sender: order.seller,
+          type: "order_cancelled",
+          targetType: "Order",
+          targetId: order._id,
+          snapshot: orderSnapshot(order),
+        })
+        if (order.seller) {
+          await notify({
+            recipient: order.seller,
+            sender: order.buyer,
+            type: "order_cancelled",
+            targetType: "Order",
+            targetId: order._id,
+            snapshot: orderSnapshot(order),
+          })
+        }
+      }
+
+      if (nextStatus === "completed" && normalize(order.paymentStatus) !== "paid") {
+        order.paymentStatus = "paid"
+      }
+    }
+
+    if (nextPaymentStatus) {
+      order.paymentStatus = nextPaymentStatus
+    }
+
+    await order.save()
+
+    return res.status(200).json({
+      success: true,
+      order,
+    })
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to update order", error: error.message })
   }
 })
 
@@ -2506,8 +2824,6 @@ router.post("/conversations/:id/messages", authMiddleware, async (req, res) => {
 /* =========================================================
  * POST /USERS/:ID/BLOCK
  * Blocks another user for the current account.
- * The block is persisted on the current user's document and
- * enforced on conversations/message routes.
  * =========================================================*/
 router.post("/users/:id/block", authMiddleware, async (req, res) => {
   try {

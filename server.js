@@ -3,6 +3,7 @@ const express = require("express")
 const apiRoutes = require("./routes")
 const connectDB = require("./connect")
 const cors = require("cors")
+const { expireOverdueOrders } = require("./utility/orderLifecycle")
 
 const app = express()
 const PORT = process.env.PORT || 4000
@@ -21,6 +22,21 @@ const startServer = async () => {
   app.listen(PORT, () => {
     console.log(`Server is running on ${PORT} and listening for requests`)
   })
+
+  // Run once on boot so overdue orders are corrected immediately,
+  // then keep checking on a fixed interval in the background.
+  const ORDER_LIFECYCLE_POLL_MS = 15 * 60 * 1000
+
+  const runOrderLifecycleSweep = async () => {
+    try {
+      await expireOverdueOrders()
+    } catch (error) {
+      console.error("Order lifecycle sweep failed:", error)
+    }
+  }
+
+  await runOrderLifecycleSweep()
+  setInterval(runOrderLifecycleSweep, ORDER_LIFECYCLE_POLL_MS)
 }
 
 startServer()

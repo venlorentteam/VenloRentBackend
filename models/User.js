@@ -116,6 +116,43 @@ const userSchema = new mongoose.Schema(
       type: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
       default: [],
     },
+    // Agent payout details are stored separately from the public profile so
+    // sellers can update bank information later without re-registering.
+    payoutDetails: {
+      bankName: {
+        type: String,
+        trim: true,
+        default: "",
+      },
+      accountName: {
+        type: String,
+        trim: true,
+        default: "",
+      },
+      accountNumber: {
+        type: String,
+        trim: true,
+        default: "",
+      },
+      bankCode: {
+        type: String,
+        trim: true,
+        default: "",
+      },
+      payoutMethod: {
+        type: String,
+        enum: ["bank_transfer", "wallet", "other"],
+        default: "bank_transfer",
+      },
+      verified: {
+        type: Boolean,
+        default: false,
+      },
+      updatedAt: {
+        type: Date,
+        default: null,
+      },
+    },
   },
   {
     // Automatically adds createdAt and updatedAt fields.
