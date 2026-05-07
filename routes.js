@@ -22,8 +22,8 @@ const authMiddleware = require("./middleware/authMiddleware") //Token decrypter 
 const Notification = require("./models/Notification")
 
 // Helpers
-const notify = require("./utility/orderLifecycle.js")
-const { expireOverdueOrders } = require("./utility/notify")
+const notify = require("./utility/notify")
+const { expireOverdueOrders } = require("./utility/orderLifecycle.js")
 const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail } = require("./emails")
 const { loginLimiter, otpLimiter, verifyLimiter, registerLimiter, passwordResetLimiter } = require('./utility/rateLimiters')
 const { cloudinary, avatarUpload, kycUpload, listingUpload } = require("./utility/cloudinary");

@@ -279,7 +279,7 @@ const renderPasswordChangedEmail = (fullName) => shell(`
         <p style="margin:0;font-size:13px;color:#991b1b;line-height:1.6;">
           🚨 <strong>Didn't make this change?</strong><br/>
           If you didn't update your password, your account may be compromised.
-          <a href="${B.appUrl}/auth/password-recovery"
+          <a href="${B.appUrl}/password-recovery"
              style="color:#dc2626;font-weight:600;text-decoration:underline;">
             Reset your password immediately
           </a>.
