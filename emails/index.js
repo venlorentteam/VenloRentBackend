@@ -294,10 +294,71 @@ const renderPasswordChangedEmail = (fullName) => shell(`
   ${note("If you have questions or concerns, visit our <a href='${B.helpUrl}' style='color:${B.primary};text-decoration:none;'>Help Center</a>.")}
 `)
 
+// ========================================
+// 5. Listing ordered email
+// ========================================
+const renderListingOrderedEmail = ({
+  agentName = "",
+  buyerName = "",
+  listingTitle = "",
+  listingPrice = "",
+  listingLocation = "",
+  orderUrl = B.appUrl,
+}) => shell(`
+  <!-- Status pill -->
+  <table cellpadding="0" cellspacing="0" border="0" role="presentation" style="margin:0 auto 20px;">
+    <tr>
+      <td style="background:#ecfdf5;border-radius:99px;padding:6px 16px;">
+        <p style="margin:0;font-size:12px;font-weight:600;color:${B.primaryDark};">New order received</p>
+      </td>
+    </tr>
+  </table>
+
+  ${h1("Your listing has been ordered")}
+  ${lead(`Hi${agentName ? ` ${agentName}` : ""}, one of your listings just received a new order. We have included the key details below so you can review it right away.`)}
+
+  <!-- Listing summary -->
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation"
+         style="background:${B.soft};border:1px solid ${B.border};border-radius:12px;margin:0 0 24px;">
+    <tr>
+      <td style="padding:18px;">
+        <p style="margin:0 0 10px;font-size:12px;font-weight:700;color:${B.muted};letter-spacing:0.8px;text-transform:uppercase;">
+          Listing details
+        </p>
+
+        <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation">
+          <tr>
+            <td style="padding:6px 0;font-size:13px;color:${B.muted};width:130px;">Listing</td>
+            <td style="padding:6px 0;font-size:13px;font-weight:600;color:${B.dark};">${listingTitle || "Untitled listing"}</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 0;font-size:13px;color:${B.muted};width:130px;">Price</td>
+            <td style="padding:6px 0;font-size:13px;font-weight:600;color:${B.dark};">${listingPrice || "N/A"}</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 0;font-size:13px;color:${B.muted};width:130px;">Location</td>
+            <td style="padding:6px 0;font-size:13px;font-weight:600;color:${B.dark};">${listingLocation || "N/A"}</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 0;font-size:13px;color:${B.muted};width:130px;">Ordered by</td>
+            <td style="padding:6px 0;font-size:13px;font-weight:600;color:${B.dark};">${buyerName || "A buyer"}</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+
+  ${btn("Review Order", orderUrl)}
+
+  ${divider}
+  ${note("If this order was unexpected, log in to your account to review the listing and order activity.")}
+`)
+
 module.exports = {
   getResendClient,
   renderOtpEmail,
   renderWelcomeEmail,
   renderPasswordResetEmail,
   renderPasswordChangedEmail,
+  renderListingOrderedEmail,
 }

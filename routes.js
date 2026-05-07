@@ -23,8 +23,8 @@ const Notification = require("./models/Notification")
 
 // Helpers
 const notify = require("./utility/notify")
-const { expireOverdueOrders } = require("./utility/orderLifecycle.js")
-const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail } = require("./emails")
+const { expireOverdueOrders, ORDER_WINDOW_HOURS, TERMINAL_ORDER_STATUSES } = require("./utility/orderLifecycle.js")
+const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail, renderListingOrderedEmail } = require("./emails")
 const { loginLimiter, otpLimiter, verifyLimiter, registerLimiter, passwordResetLimiter } = require('./utility/rateLimiters')
 const { cloudinary, avatarUpload, kycUpload, listingUpload } = require("./utility/cloudinary");
 
@@ -109,87 +109,8 @@ const checkContentModeration = ({ title = "", description = "" }) => {
     reasons: hits.map((term) => `Banned phrase detected: "${term}"`),
   }
 }
+const normalizeOrderStatus = (value = "") => normalize(value)
 
-// ================================================================
-// Order lifecycle helpers
-// Keep property availability and order status aligned in one place.
-// ================================================================
-// const ORDER_WINDOW_HOURS = 72
-// const ACTIVE_ORDER_STATUSES = new Set(["pending", "accepted"])
-// const TERMINAL_ORDER_STATUSES = new Set(["cancelled", "rejected", "completed"])
-
-// const normalizeOrderStatus = (value = "") => normalize(value)
-
-// const getPropertyStatusForOrder = (orderStatus, listingType = "") => {
-//   const status = normalizeOrderStatus(orderStatus)
-//   const type = normalize(listingType)
-
-//   if (status === "cancelled" || status === "rejected") {
-//     return "available"
-//   }
-
-//   if (status === "completed") {
-//     return type === "sale" ? "archived" : "rented"
-//   }
-
-//   if (status === "pending" || status === "accepted" || status === "pending_proof") {
-//     return "reserved"
-//   }
-
-//   return null
-// }
-
-// const orderSnapshot = (order) => {
-//   const property = order?.property || {}
-//   return {
-//     title: property.title || "",
-//     price: property.amount ? `â‚¦${Number(property.amount).toLocaleString("en-NG")}` : "",
-//     image: property.media?.[0]?.url || "",
-//     location: [property.location?.town, property.location?.state].filter(Boolean).join(", "),
-//   }
-// }
-
-// const syncPropertyStatusFromOrder = async (order, nextStatus) => {
-//   const propertyId = order?.property?._id || order?.property
-//   if (!propertyId) return null
-
-//   const listingType = order?.property?.listing_type || ""
-//   const propertyStatus = getPropertyStatusForOrder(nextStatus, listingType)
-//   if (!propertyStatus) return null
-
-//   await Property.findByIdAndUpdate(propertyId, { status: propertyStatus })
-//   return propertyStatus
-// }
-
-// const expireOverdueOrders = async () => {
-//   const now = new Date()
-//   const overdueOrders = await Order.find({
-//     status: { $in: ["pending", "accepted"] },
-//     expiresAt: { $lte: now },
-//   }).populate("property", "title amount listing_type location media")
-
-//   for (const order of overdueOrders) {
-//     if (TERMINAL_ORDER_STATUSES.has(normalizeOrderStatus(order.status))) continue
-
-//     order.status = "cancelled"
-//     if (["unpaid", "pending_proof"].includes(normalizeOrderStatus(order.paymentStatus))) {
-//       order.paymentStatus = "failed"
-//     }
-//     await order.save()
-//     await syncPropertyStatusFromOrder(order, "cancelled")
-
-//     if (order.buyer) {
-//       await notify({
-//         recipient: order.buyer,
-//         sender: order.seller || null,
-//         type: "order_cancelled",
-//         targetType: "Order",
-//         targetId: order._id,
-//         snapshot: orderSnapshot(order),
-//       })
-//     }
-//   }
-// }
 
 // Health check route
 router.get("/", async (req, res) => {
@@ -2029,6 +1950,36 @@ router.post("/orders", authMiddleware, async (req, res) => {
         location: "",
       },
     })
+
+    try {
+      const [seller, buyer] = await Promise.all([
+        User.findById(property.owner).select("fullName email username"),
+        User.findById(req.user.id).select("fullName username"),
+      ])
+      if (seller?.email) {
+        const resend = getResendClient()
+        const listingLocation = [property.location?.town, property.location?.state].filter(Boolean).join(", ")
+        const listingPrice = property.amount ? `₦${Number(property.amount).toLocaleString("en-NG")}` : ""
+        const buyerName = buyer?.fullName || buyer?.username || "A buyer"
+        const orderUrl = `${process.env.APP_URL}/orders/${order._id}`
+
+        await resend.emails.send({
+          from: process.env.AUTH_EMAIL,
+          to: seller.email,
+          subject: "Your listing has been ordered",
+          html: renderListingOrderedEmail({
+            agentName: seller.fullName,
+            buyerName,
+            listingTitle: property.title || "",
+            listingPrice,
+            listingLocation,
+            orderUrl,
+          }),
+        })
+      }
+    } catch (emailError) {
+      console.error("Failed to send listing ordered email:", emailError.message)
+    }
 
     return res.status(201).json({ success: true, order })
   } catch (error) {
