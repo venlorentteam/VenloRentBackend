@@ -6,7 +6,7 @@ const Admin = require("../models/Admin")
 
 const demoAdmins = [
   {
-    fullName: "Demo Super Admin",
+    fullName: "Super Admin",
     email: "admin@venlorent.com",
     password: "VenloRent_2026$",
     role: "superadmin",
@@ -15,7 +15,7 @@ const demoAdmins = [
     mustChangePassword: true,
   },
   {
-    fullName: "Demo Admin",
+    fullName: "Admin",
     email: "admin@example.com",
     password: "Admin123!",
     role: "admin",
@@ -30,7 +30,7 @@ const demoAdmins = [
     mustChangePassword: true,
   },
   {
-    fullName: "Demo Moderator",
+    fullName: "Moderator",
     email: "moderator@example.com",
     password: "Admin123!",
     role: "moderator",
@@ -54,13 +54,12 @@ const seedAdmins = async () => {
     await Admin.deleteMany({ email: { $in: demoEmails } })
     await Admin.create(demoAdmins)
 
-    console.log("Demo admin collection seeded successfully.")
-    console.log("Use these credentials to test login:")
+    //console.log("Admin collection seeded successfully.")
     demoAdmins.forEach((admin) => {
       console.log(`- ${admin.email} / ${admin.password}`)
     })
   } catch (error) {
-    console.error("Failed to seed demo admins:", error)
+    console.error("Failed to seed admins:", error)
     process.exitCode = 1
   } finally {
     await mongoose.disconnect()
