@@ -6,7 +6,7 @@ const notify = require("./notify")
 // always use the same expiry logic.
 const ORDER_WINDOW_HOURS = 72
 const ACTIVE_ORDER_STATUSES = new Set(["pending", "accepted"])
-const TERMINAL_ORDER_STATUSES = new Set(["cancelled", "rejected", "completed"])
+const TERMINAL_ORDER_STATUSES = new Set(["cancelled", "rejected", "completed", "expired"])
 
 const normalize = (value = "") => value.toString().toLowerCase().trim()
 
@@ -14,7 +14,7 @@ const getPropertyStatusForOrder = (orderStatus, listingType = "") => {
   const status = normalize(orderStatus)
   const type = normalize(listingType)
 
-  if (status === "cancelled" || status === "rejected") return "available"
+  if (status === "cancelled" || status === "rejected" || status === "expired") return "available"
   if (status === "completed") return type === "sale" ? "archived" : "rented"
   if (status === "pending" || status === "accepted" || status === "pending_proof") return "reserved"
 
@@ -53,19 +53,30 @@ const expireOverdueOrders = async () => {
   for (const order of overdueOrders) {
     if (TERMINAL_ORDER_STATUSES.has(normalize(order.status))) continue
 
-    order.status = "cancelled"
+    order.status = "expired"
     if (["unpaid", "pending_proof"].includes(normalize(order.paymentStatus))) {
       order.paymentStatus = "failed"
     }
 
     await order.save()
-    await syncPropertyStatusFromOrder(order, "cancelled")
+    await syncPropertyStatusFromOrder(order, "expired")
 
     if (order.buyer) {
       await notify({
         recipient: order.buyer,
         sender: order.seller || null,
-        type: "order_cancelled",
+        type: "order_expired",
+        targetType: "Order",
+        targetId: order._id,
+        snapshot: orderSnapshot(order),
+      })
+    }
+
+    if (order.seller) {
+      await notify({
+        recipient: order.seller,
+        sender: order.buyer || null,
+        type: "order_expired",
         targetType: "Order",
         targetId: order._id,
         snapshot: orderSnapshot(order),

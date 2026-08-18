@@ -8,9 +8,10 @@ const { expireOverdueOrders } = require("./utility/orderLifecycle")
 const app = express()
 const PORT = process.env.PORT || 4000
 
-//Call Express Middlewares
+// Call Express Middlewares
 app.use(cors())
 app.use("/auth/kyc/didit-webhook", express.raw({ type: "application/json" })) // raw body required for HMAC verification in KYC webhook
+app.use("/billing/webhook", express.raw({ type: "application/json" })) // raw body required for HMAC verification in Bachs webhook
 // Raw body parsing is required to be placed before the general JSON parser, otherwise the webhook signature verification will fail due to altered request body.
 app.use(express.json({ limit: "50mb" }))
 app.use(express.urlencoded({ limit: "50mb", extended: true }))

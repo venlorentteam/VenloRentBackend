@@ -14,19 +14,24 @@ const RequestResponse = require("./models/RequestResponse")
 const Discussion = require("./models/Discussion")
 const KycSubmission = require("./models/KycSubmission")
 const Order = require("./models/Order")
+const PaymentTransaction = require("./models/PaymentTransaction")
 const Follow = require("./models/Follow")
 const Report = require("./models/Report")
+const Admin = require("./models/Admin")
 const Conversation = require("./models/Conversation")
 const Message = require("./models/Messages")
 const authMiddleware = require("./middleware/authMiddleware") //Token decrypter and userID extractor 
+const adminAuthMiddleware = require("./middleware/adminAuthMiddleware")
 const Notification = require("./models/Notification")
 
 // Helpers
 const notify = require("./utility/notify")
 const { expireOverdueOrders, ORDER_WINDOW_HOURS, TERMINAL_ORDER_STATUSES } = require("./utility/orderLifecycle.js")
+const { expireOverdueRequests, isRequestExpired, REQUEST_WINDOW_DAYS } = require("./utility/requestLifecycle.js")
 const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail, renderListingOrderedEmail } = require("./emails")
 const { loginLimiter, otpLimiter, verifyLimiter, registerLimiter, passwordResetLimiter } = require('./utility/rateLimiters')
-const { cloudinary, avatarUpload, kycUpload, listingUpload } = require("./utility/cloudinary");
+const { bachs, verifyBachsSignature, getOrCreateBachsCustomer, PLAN_PRODUCTS, PRODUCT_TO_PLAN } = require('./utility/bachs')
+const { cloudinary, avatarUpload, kycUpload, listingUpload } = require("./utility/cloudinary")
 
 require("dotenv").config()
 const router = express.Router()
@@ -111,6 +116,43 @@ const checkContentModeration = ({ title = "", description = "" }) => {
 }
 const normalizeOrderStatus = (value = "") => normalize(value)
 
+const toTitleCase = (value = "") =>
+  value
+    .toString()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+
+const formatCurrency = (value = 0) =>
+  new Intl.NumberFormat("en-NG", {
+    style: "currency",
+    currency: "NGN",
+    maximumFractionDigits: 0,
+  }).format(Number(value || 0))
+
+const formatRelativeTime = (dateLike) => {
+  if (!dateLike) return "Recently"
+
+  const date = new Date(dateLike)
+  if (Number.isNaN(date.getTime())) return "Recently"
+
+  const diffMs = Date.now() - date.getTime()
+  const diffMinutes = Math.max(Math.floor(diffMs / 60000), 0)
+  if (diffMinutes < 60) return `${Math.max(diffMinutes, 1)}m ago`
+
+  const diffHours = Math.floor(diffMinutes / 60)
+  if (diffHours < 24) return `${diffHours}h ago`
+
+  const diffDays = Math.floor(diffHours / 24)
+  return `${diffDays}d ago`
+}
+
+// Helper for Payout Details check
+  const hasCompletePayoutDetails = (payoutDetails = {}) =>
+    ["bankName", "accountName", "accountNumber", "payoutMethod"].every(
+      (field) => payoutDetails?.[field]?.toString().trim()
+    )
 
 // Health check route
 router.get("/", async (req, res) => {
@@ -233,6 +275,12 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" })
     }
 
+    if (user.status !== "active") {
+      return res.status(403).json({
+        message: `Your account is currently ${user.status}. Please contact support for assistance.`,
+      })
+    }
+
     // Compare provided password with hashed password in DB using the model's comparePassword method.
     const isPasswordValid = await user.comparePassword(password)
     if (!isPasswordValid) {
@@ -261,15 +309,11 @@ router.post("/auth/login", loginLimiter, async (req, res) => {
       return res.status(400).json({isEmailVerified: false, message: "Please verify your email. A new OTP has been sent"})
     }
 
-    if (user.status !== "active") {
-      return res.status(403).json({ message: `Your account is currently ${user.status}. Please contact support for assistance.` })
-    }
-    
     //Generate JWT token
     const token = jwt.sign(
       { id: user._id, email: user.email },
       process.env.JWT_SECRET,
-      { expiresIn: "168h" }
+      { expiresIn: "730h" }
     )
     const userResponse = {
       id: user._id,
@@ -869,7 +913,7 @@ router.patch("/payment-details", authMiddleware, async (req, res) => {
     const trimmedBankName = bankName.toString().trim()
     const trimmedAccountName = accountName.toString().trim()
     const trimmedAccountNumber = accountNumber.toString().trim()
-    const trimmedBankCode = bankCode.toString().trim()
+    const trimmedBankCode = bankCode ? bankCode.toString().trim() : ""
     const normalizedMethod = payoutMethod.toString().trim().toLowerCase()
 
     const errors = {}
@@ -1153,6 +1197,102 @@ router.post("/auth/kyc/didit-webhook",
     }
   }
 )
+/*==================================================
+  Bachs: Billing and subscription routes
+  ==================================================*/
+router.post('/billing/checkout-session', authMiddleware, async (req, res) => {
+  try {
+    const { plan } = req.body
+    const product = PLAN_PRODUCTS[plan]
+    if (!product) {
+      return res.status(400).json({ message: 'Invalid plan selected' })
+    }
+
+    const user = await User.findById(req.user.id)
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' })
+    }
+
+    const customerId = await getOrCreateBachsCustomer(user)
+
+    const session = await bachs.checkout.create({
+      customer: customerId,
+      product,
+      billing: 'subscription',
+      tax: 'auto',
+      settlement: 'NGN',
+      metadata: { plan },
+      success_url: `${process.env.APP_URL}/settings/subscription?status=success`,
+      cancel_url: `${process.env.APP_URL}/settings/subscription?status=cancelled`,
+    })
+
+    return res.status(200).json({ success: true, checkoutUrl: session.url })
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to start checkout', error: error.message })
+  }
+})
+
+/*===================================================
+  Bachs webhook endpoint for subscription events
+  ===================================================*/ 
+router.post('/billing/webhook', async (req, res) => {
+  try {
+    const timestampHeader = req.headers['x-bachs-timestamp']
+    const signatureHeader = req.headers['x-bachs-signature']
+    if (!timestampHeader || !signatureHeader) {
+      return res.status(401).json({ message: 'Missing signature headers' })
+    }
+
+    const isValid = verifyBachsSignature(req.body, process.env.BACHS_WEBHOOK_SECRET, timestampHeader, signatureHeader)
+    if (!isValid) {
+      return res.status(401).json({ message: 'Invalid signature' })
+    }
+
+    const event = JSON.parse(req.body.toString('utf-8'))
+
+    // Dedupe — at-least-once delivery per Bachs docs
+    // try {
+    //   await ProcessedWebhookEvent.create({ eventId: event.id })
+    // } catch (err) {
+    //   if (err.code === 11000) return res.status(200).json({ received: true, duplicate: true })
+    //   throw err
+    // }
+
+    switch (event.type) {
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated': {
+        const sub = event.data
+        const resolvedPlan = sub.metadata?.plan || PRODUCT_TO_PLAN[sub.product] || 'free'
+        await User.findOneAndUpdate(
+          { bachsCustomerId: sub.customer },
+          {
+            plan: resolvedPlan,
+            'subscription.id': sub.id,
+            'subscription.status': sub.status,
+            'subscription.productId': sub.product,
+            'subscription.currentPeriodEnd': sub.current_period_end,
+          }
+        )
+        break
+      }
+      case 'customer.subscription.deleted': {
+        const sub = event.data
+        await User.findOneAndUpdate(
+          { bachsCustomerId: sub.customer },
+          { plan: 'free', 'subscription.status': 'canceled' }
+        )
+        break
+      }
+      default:
+        break
+    }
+
+    return res.status(200).json({ received: true })
+  } catch (err) {
+    console.error('Bachs webhook error:', err.message)
+    return res.status(200).json({ received: true })
+  }
+})
 
 /*===================================================
   Property routes and other property related endpoints
@@ -1241,6 +1381,13 @@ router.post("/create-listing", authMiddleware, listingUploadMiddleware, async (r
     const user = await User.findById(req.user.id).select("kycStatus")
     if (!user || user.kycStatus !== "verified") {
       return res.status(403).json({ message: "Only verified agents can create listings" })
+    }
+
+    // Check if user payout details are filled
+    if (!hasCompletePayoutDetails(user.payoutDetails)) {
+      return res.status(403).json({
+        message: "Complete your payment details before creating a listing",
+      })
     }
 
     // Step 1: Pre-publish moderation checks.
@@ -1615,7 +1762,8 @@ router.post("/create-request", authMiddleware, async (req, res) => {
           town: location.town || "",
         }
 
-    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // default to 30 days from now
+    // Requests stay active for 30 days, then the lifecycle helper marks them expired.
+    const expiresAt = new Date(Date.now() + REQUEST_WINDOW_DAYS * 24 * 60 * 60 * 1000)
 
     const request = await Request.create({
       requester: req.user.id,
@@ -1643,6 +1791,8 @@ router.post("/create-request", authMiddleware, async (req, res) => {
 // List requests (public)
 router.get("/requests", async (req, res) => {
   try {
+    await expireOverdueRequests()
+
     // Optional auth: allow likedByMe without forcing login.
     let userId = null
     const authHeader = req.headers.authorization || ""
@@ -1729,6 +1879,7 @@ router.get("/requests/:id/agent-responses", async (req, res) => {
 // Create an agent response (protected, agent only)
 router.post("/requests/:id/agent-responses", authMiddleware, async (req, res) => {
   try {
+    await expireOverdueRequests()
     const text = req.body?.text?.toString().trim()
     if (!text) {
       return res.status(400).json({ message: "Response text is required" })
@@ -1739,9 +1890,12 @@ router.post("/requests/:id/agent-responses", authMiddleware, async (req, res) =>
       return res.status(403).json({ message: "Only verified agents can post responses" })
     }
 
-    const request = await Request.findById(req.params.id).select("_id requester description budget location")
+    const request = await Request.findById(req.params.id).select("_id requester description budget location status expiresAt")
     if (!request) {
       return res.status(404).json({ message: "Request not found" })
+    }
+    if (isRequestExpired(request)) {
+      return res.status(400).json({ message: "Request has expired" })
     }
 
     const response = await RequestResponse.create({
@@ -1818,16 +1972,19 @@ router.get("/requests/:id/discussions", async (req, res) => {
 // Create discussion comment (protected)
 router.post("/requests/:id/discussions", authMiddleware, async (req, res) => {
   try {
+    await expireOverdueRequests()
+
     const text = req.body?.text?.toString().trim()
     if (!text) {
       return res.status(400).json({ message: "Comment text is required" })
     }
 
-    const request = await Request.findById(req.params.id).select("_id requester status description budget location")
+    const request = await Request.findById(req.params.id).select("_id requester status expiresAt description budget location")
     if (!request) {
       return res.status(404).json({ message: "Request not found" })
     }
-    if (request.status === "expired") {
+    // Guard both the stored status and the actual expiry timestamp.
+    if (isRequestExpired(request)) {
       return res.status(400).json({ message: "Request has expired" })
     }
 
@@ -1886,7 +2043,7 @@ router.get("/orders", authMiddleware, async (req, res) => {
       .sort({ createdAt: -1 })
       .populate("property", "title amount commission listing_type property_type location media")
       .populate("buyer", "fullName username avatar role kycStatus plan")
-      .populate("seller", "fullName username avatar role kycStatus plan")
+      .populate("seller", "fullName username avatar role kycStatus plan payoutDetails")
 
     return res.status(200).json({ success: true, items })
   } catch (error) {
@@ -1998,8 +2155,10 @@ router.patch("/orders/:orderId/status", authMiddleware, async (req, res) => {
       return res.status(400).json({ message: "status or paymentStatus is required" })
     }
 
-    const validStatuses = new Set(["accepted", "rejected", "completed", "cancelled"])
-    const validPaymentStatuses = new Set(["unpaid", "pending_proof", "paid", "failed", "refunded", "disputed"])
+    // Old seller approval flow retired:
+    // the order now only moves through cancellation or completion.
+    const validStatuses = new Set(["completed", "cancelled"])
+    const validPaymentStatuses = new Set(["pending_proof", "paid"])
 
     if (nextStatus && !validStatuses.has(nextStatus)) {
       return res.status(400).json({ message: "Invalid order status" })
@@ -2022,16 +2181,16 @@ router.patch("/orders/:orderId/status", authMiddleware, async (req, res) => {
     const isExpired = expiresAt && now > expiresAt && !TERMINAL_ORDER_STATUSES.has(normalizeOrderStatus(order.status))
 
     if (isExpired) {
-      order.status = "cancelled"
+      order.status = "expired"
       if (["unpaid", "pending_proof"].includes(normalizeOrderStatus(order.paymentStatus))) {
         order.paymentStatus = "failed"
       }
       await order.save()
-      await syncPropertyStatusFromOrder(order, "cancelled")
+      await syncPropertyStatusFromOrder(order, "expired")
       await notify({
         recipient: order.buyer,
         sender: order.seller,
-        type: "order_cancelled",
+        type: "order_expired",
         targetType: "Order",
         targetId: order._id,
         snapshot: orderSnapshot(order),
@@ -2040,7 +2199,7 @@ router.patch("/orders/:orderId/status", authMiddleware, async (req, res) => {
         await notify({
           recipient: order.seller,
           sender: order.buyer,
-          type: "order_cancelled",
+          type: "order_expired",
           targetType: "Order",
           targetId: order._id,
           snapshot: orderSnapshot(order),
@@ -2059,15 +2218,39 @@ router.patch("/orders/:orderId/status", authMiddleware, async (req, res) => {
       return res.status(403).json({ message: "You are not allowed to update this order" })
     }
 
-    if (nextStatus === "accepted" || nextStatus === "rejected" || nextStatus === "completed") {
-      if (!isSeller) {
-        return res.status(403).json({ message: "Only the seller can approve or complete this order" })
+    const propertyStatus = normalizeOrderStatus(order.property?.status)
+    const propertyUnavailable = !propertyStatus || propertyStatus !== "reserved"
+
+    // Buyer flow:
+    // - can cancel their own order
+    // - can mark payment as pending proof
+    if (isBuyer) {
+      if (nextStatus && nextStatus !== "cancelled") {
+        return res.status(403).json({ message: "Buyers can only cancel an order" })
+      }
+      if (nextPaymentStatus && nextPaymentStatus !== "pending_proof") {
+        return res.status(403).json({ message: "Buyers can only mark payment as pending proof" })
       }
     }
 
-    if (nextStatus === "cancelled") {
-      if (!isBuyer && !isSeller) {
-        return res.status(403).json({ message: "You are not allowed to cancel this order" })
+    // Seller flow:
+    // - can cancel only when the property is no longer available
+    // - can confirm payment only after the buyer has marked it as pending proof
+    if (isSeller) {
+      if (nextStatus === "cancelled" && !propertyUnavailable) {
+        return res.status(409).json({ message: "Property is still reserved, so this order cannot be cancelled from the seller side" })
+      }
+
+      if (nextStatus && nextStatus !== "cancelled" && nextStatus !== "completed") {
+        return res.status(403).json({ message: "Seller approval/rejection is no longer part of the order flow" })
+      }
+
+      if (nextPaymentStatus && nextPaymentStatus !== "paid") {
+        return res.status(403).json({ message: "Seller can only confirm payment as paid" })
+      }
+
+      if (nextStatus === "completed" && normalizeOrderStatus(order.paymentStatus) !== "pending_proof" && nextPaymentStatus !== "paid") {
+        return res.status(409).json({ message: "Payment must be marked as pending proof before the seller can confirm it" })
       }
     }
 
@@ -2075,22 +2258,18 @@ router.patch("/orders/:orderId/status", authMiddleware, async (req, res) => {
       order.note = note.toString().trim()
     }
 
+    const shouldRestorePropertyOnCancel = nextStatus === "cancelled" && isBuyer
+
     if (nextStatus) {
       order.status = nextStatus
-      await syncPropertyStatusFromOrder(order, nextStatus)
 
-      if (nextStatus === "accepted") {
-        await notify({
-          recipient: order.buyer,
-          sender: order.seller,
-          type: "order_accepted",
-          targetType: "Order",
-          targetId: order._id,
-          snapshot: orderSnapshot(order),
-        })
+      if (nextStatus === "completed") {
+        // Old approval path retired: completion now only follows seller
+        // payment confirmation, not a separate approval step.
+        await syncPropertyStatusFromOrder(order, nextStatus)
       }
 
-      if (nextStatus === "cancelled" || nextStatus === "rejected") {
+      if (nextStatus === "cancelled") {
         await notify({
           recipient: order.buyer,
           sender: order.seller,
@@ -2109,6 +2288,11 @@ router.patch("/orders/:orderId/status", authMiddleware, async (req, res) => {
             snapshot: orderSnapshot(order),
           })
         }
+
+        if (shouldRestorePropertyOnCancel) {
+          // Buyer cancellations release the reservation back to available.
+          await syncPropertyStatusFromOrder(order, "cancelled")
+        }
       }
 
       if (nextStatus === "completed" && normalize(order.paymentStatus) !== "paid") {
@@ -2117,7 +2301,18 @@ router.patch("/orders/:orderId/status", authMiddleware, async (req, res) => {
     }
 
     if (nextPaymentStatus) {
+      if (nextPaymentStatus === "pending_proof" && !isBuyer) {
+        return res.status(403).json({ message: "Only the buyer can mark payment as pending proof" })
+      }
+      if (nextPaymentStatus === "paid" && !isSeller) {
+        return res.status(403).json({ message: "Only the seller can confirm payment" })
+      }
       order.paymentStatus = nextPaymentStatus
+
+      if (nextPaymentStatus === "paid") {
+        order.status = "completed"
+        await syncPropertyStatusFromOrder(order, "completed")
+      }
     }
 
     await order.save()
@@ -3070,5 +3265,579 @@ router.post("/requests/:id/report", authMiddleware, async (req, res) => {
     return res.status(500).json({ message: "Failed to submit report", error: error.message })
   }
 })
+// ===============================================
+// ========== Admin Section Endpoints ============
+// ===============================================
 
+// Admin Login
+router.post("/admin/login", async (req, res) => {
+  try {
+    const { email, password } = req.body
+
+    if (!email || !password) {
+      return res.status(400).json({ message: "Email and password are required" })
+    }
+    const errors = {}
+    if (email.length > 50) {
+      errors.email = "Email length cannot surpass 50 characters"
+    } else if (!/^\S+@\S+\.\S+$/.test(email)) {
+      errors.email = "Invalid email address"
+    }
+
+    if (password.length < 6) {
+      errors.password = "Password must be at least 6 characters"
+    } 
+
+    if (Object.keys(errors).length > 0) {
+      return res.status(400).json({ errors })
+    }
+
+    const admin = await Admin.findOne({ email: email.toLowerCase().trim() })
+    if (!admin) {
+      return res.status(401).json({ message: "Invalid credentials" })
+    }
+
+    if (admin.status !== "active") {
+      return res.status(403).json({ message: "Admin account is disabled" })
+    }
+
+    const isPasswordValid = await admin.comparePassword(password)
+    if (!isPasswordValid) {
+      return res.status(401).json({ message: "Incorrect email or password" })
+    }
+
+    admin.lastLoginAt = new Date()
+    await admin.save()
+
+    const token = jwt.sign(
+      {
+        id: admin._id,
+        type: "admin",
+        role: admin.role,
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: "168h" }
+    )
+
+    return res.status(200).json({
+      success: true,
+      token,
+      admin: {
+        id: admin._id,
+        fullName: admin.fullName,
+        email: admin.email,
+        role: admin.role,
+        status: admin.status,
+        permissions: admin.permissions,
+        avatar: admin.avatar,
+        lastLoginAt: admin.lastLoginAt,
+      },
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to login admin",
+      error: error.message,
+    })
+  }
+})
+
+router.get("/admin/me", adminAuthMiddleware, async (req, res) => {
+  try {
+    return res.status(200).json({
+      success: true,
+      admin: req.admin,
+    }) 
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch admin profile",
+      error: error.message,
+    })
+  }
+})
+
+router.get("/admin/dashboard/overview", adminAuthMiddleware, async (req, res) => {
+  try {
+    const [
+      totalUsers,
+      verifiedAgents,
+      pendingKycCount,
+      completedOrdersCount,
+      listingsCount,
+      paymentsCount,
+      openReportsCount,
+      flaggedPropertiesCount,
+      recentKycSubmissions,
+      recentOrders,
+      recentPayments,
+      recentReports,
+      flaggedProperties,
+    ] = await Promise.all([
+      User.countDocuments({}),
+      User.countDocuments({ role: "agent", kycStatus: "verified", status: "active" }),
+      KycSubmission.countDocuments({ status: { $in: ["submitted", "in_review"] } }),
+      Order.countDocuments({ status: "completed" }),
+      Property.countDocuments({}),
+      PaymentTransaction.countDocuments({}),
+      Report.countDocuments({ status: { $in: ["open", "in_review"] } }),
+      Property.countDocuments({ moderationStatus: { $in: ["pending", "flagged", "rejected"] } }),
+      KycSubmission.find()
+        .sort({ submittedAt: -1, createdAt: -1 })
+        .limit(5)
+        .populate("user", "fullName username country emailVerified kycStatus createdAt"),
+      Order.find()
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .populate("property", "title amount location")
+        .populate("buyer", "fullName username")
+        .populate("seller", "fullName username"),
+      PaymentTransaction.find()
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .populate("order", "property amount status createdAt")
+        .populate("payer", "fullName username")
+        .populate("payee", "fullName username"),
+      Report.find({ status: { $in: ["open", "in_review"] } })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .populate("reporter", "fullName username"),
+      Property.find({ moderationStatus: { $in: ["pending", "flagged", "rejected"] } })
+        .sort({ updatedAt: -1, createdAt: -1 })
+        .limit(5)
+        .populate("owner", "fullName username"),
+    ])
+
+    const mapKycStatus = (value = "") => {
+      const normalized = normalize(value)
+      if (normalized === "verified" || normalized === "approved") return "approved"
+      if (normalized === "rejected") return "rejected"
+      return "pending"
+    }
+
+    const kycApplications = recentKycSubmissions.map((submission) => {
+      const applicant = submission.user || {}
+      const status = mapKycStatus(submission.status)
+      const addressLabel = submission.officeAddress || applicant.country || "Nigeria"
+
+      return {
+        id: submission._id.toString(),
+        applicantName: applicant.fullName || submission.businessName || "Unknown applicant",
+        location: addressLabel,
+        status,
+        livenessCheck: submission.diditSessionId ? (status === "approved" ? "passed" : "pending") : "pending",
+        idVerification:
+          status === "approved" ? "passed" : status === "rejected" ? "failed" : "pending",
+        proofOfAddress:
+          (submission.addressProof?.url || status === "approved")
+            ? "passed"
+            : status === "rejected"
+            ? "failed"
+            : "pending",
+        submittedAt: formatRelativeTime(submission.submittedAt || submission.createdAt),
+      }
+    })
+
+    const orders = recentOrders.map((order) => {
+      const buyer = order.buyer || {}
+      const seller = order.seller || {}
+
+      return {
+        id: order._id.toString(),
+        property: order.property?.title || "Property",
+        customer: buyer.fullName || buyer.username || "Buyer",
+        agent: seller.fullName || seller.username || "Seller",
+        amount: formatCurrency(order.amount),
+        status: toTitleCase(order.status),
+        createdAt: formatRelativeTime(order.createdAt),
+        reservationEnds: order.expiresAt
+          ? new Date(order.expiresAt).toLocaleDateString("en-NG", {
+              day: "2-digit",
+              month: "short",
+              year: "numeric",
+            })
+          : "-",
+      }
+    })
+
+    const payments = recentPayments.map((payment) => {
+      const payer = payment.payer || {}
+      const payee = payment.payee || {}
+
+      return {
+        id: payment._id.toString(),
+        orderId: payment.order?._id?.toString?.() || payment.order?.toString?.() || payment.order,
+        customer: payer.fullName || payer.username || "Payer",
+        agent: payee.fullName || payee.username || "Payee",
+        amount: formatCurrency(payment.amount),
+        gateway: toTitleCase(payment.method),
+        status: toTitleCase(payment.status),
+        date: formatRelativeTime(payment.createdAt),
+      }
+    })
+
+    const flaggedItems = [
+      ...recentReports.map((report) => ({
+        id: `report-${report._id.toString()}`,
+        type: toTitleCase(report.targetType),
+        target: report.targetId?.toString?.().slice(-8) || "Reported item",
+        reason: toTitleCase(report.reason),
+        reports: 1,
+        status: toTitleCase(report.status),
+        createdAt: report.createdAt,
+      })),
+      ...flaggedProperties.map((property) => ({
+        id: `property-${property._id.toString()}`,
+        type: "Property",
+        target: property.title || "Flagged property",
+        reason: property.moderationReasons?.[0] || "Marked for review",
+        reports: property.reportsCount || 0,
+        status: toTitleCase(property.moderationStatus),
+        createdAt: property.updatedAt || property.createdAt,
+      })),
+    ]
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, 6)
+      .map(({ createdAt, ...item }) => item)
+
+    const recentActivities = [
+      ...recentKycSubmissions.map((submission) => ({
+        sortAt: new Date(submission.submittedAt || submission.createdAt).getTime(),
+        action:
+          mapKycStatus(submission.status) === "approved"
+            ? "KYC approved"
+            : mapKycStatus(submission.status) === "rejected"
+            ? "KYC rejected"
+            : "New KYC submitted",
+        user: submission.user?.fullName || submission.businessName || "KYC applicant",
+      })),
+      ...recentOrders.map((order) => ({
+        sortAt: new Date(order.createdAt).getTime(),
+        action: `Order ${toTitleCase(order.status).toLowerCase()}`,
+        user:
+          order.buyer?.fullName ||
+          order.buyer?.username ||
+          order.seller?.fullName ||
+          order.seller?.username ||
+          "Order participant",
+      })),
+      ...recentPayments.map((payment) => ({
+        sortAt: new Date(payment.createdAt).getTime(),
+        action: `Payment ${toTitleCase(payment.status).toLowerCase()}`,
+        user: payment.payer?.fullName || payment.payer?.username || "Payment participant",
+      })),
+      ...recentReports.map((report) => ({
+        sortAt: new Date(report.createdAt).getTime(),
+        action: `Report ${toTitleCase(report.status).toLowerCase()}`,
+        user: report.reporter?.fullName || report.reporter?.username || "Reporter",
+      })),
+    ]
+      .sort((a, b) => b.sortAt - a.sortAt)
+      .slice(0, 6)
+      .map((item) => ({
+        id: `${item.action}-${item.sortAt}`,
+        action: item.action,
+        user: item.user,
+        time: formatRelativeTime(item.sortAt),
+      }))
+
+    return res.status(200).json({
+      success: true,
+      overview: {
+        stats: {
+          totalUsers,
+          verifiedAgents,
+          pendingKycCount,
+          completedOrdersCount,
+          listingsCount,
+          paymentsCount,
+          moderationQueueCount: openReportsCount + flaggedPropertiesCount,
+        },
+        kycApplications,
+        orders,
+        payments,
+        flaggedItems,
+        recentActivities,
+      },
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch admin dashboard overview",
+      error: error.message,
+    })
+  }
+})
+
+router.get("/admin/orders", adminAuthMiddleware, async (req, res) => {
+  try {
+    const status = normalize(req.query.status || "")
+    const search = normalize(req.query.search || "")
+    const allowedStatuses = new Set(["pending", "accepted", "rejected", "completed", "cancelled", "expired"])
+
+    const query = {}
+    if (status && status !== "all") {
+      if (!allowedStatuses.has(status)) {
+        return res.status(400).json({
+          message: "Invalid order status filter",
+          allowedStatuses: Array.from(allowedStatuses),
+        })
+      }
+
+      query.status = status
+    }
+
+    const orders = await Order.find(query)
+      .sort({ createdAt: -1 })
+      .populate("property", "title amount location media")
+      .populate("buyer", "fullName username avatar")
+      .populate("seller", "fullName username avatar payoutDetails")
+
+    const filteredOrders = search
+      ? orders.filter((order) => {
+          const propertyTitle = normalize(order.property?.title || "")
+          const buyerName = normalize(order.buyer?.fullName || order.buyer?.username || "")
+          const sellerName = normalize(order.seller?.fullName || order.seller?.username || "")
+          const orderId = normalize(order._id.toString())
+          const orderStatus = normalize(order.status || "")
+          return [propertyTitle, buyerName, sellerName, orderId, orderStatus].some((field) =>
+            field.includes(search)
+          )
+        })
+      : orders
+
+    const mappedOrders = filteredOrders.map((order) => {
+      const buyer = order.buyer || {}
+      const seller = order.seller || {}
+
+      return {
+        id: order._id.toString(),
+        property: order.property?.title || "Property",
+        customer: buyer.fullName || buyer.username || "Buyer",
+        agent: seller.fullName || seller.username || "Seller",
+        amount: formatCurrency(order.amount),
+        rawAmount: order.amount,
+        status: order.status,
+        paymentStatus: order.paymentStatus,
+        createdAt: formatRelativeTime(order.createdAt),
+        reservationEnds: order.expiresAt
+          ? new Date(order.expiresAt).toLocaleDateString("en-NG", {
+              day: "2-digit",
+              month: "short",
+              year: "numeric",
+            })
+          : "-",
+      }
+    })
+
+    return res.status(200).json({
+      success: true,
+      orders: mappedOrders,
+      totalOrders: mappedOrders.length,
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch admin orders",
+      error: error.message,
+    })
+  }
+})
+
+router.get("/admin/users", adminAuthMiddleware, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1)
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100)
+    const search = (req.query.search || "").trim()
+    const skip = (page - 1) * limit
+
+    const filter = {}
+    if (search) {
+      const searchRegex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i")
+      filter.$or = [
+        { fullName: searchRegex },
+        { email: searchRegex },
+        { username: searchRegex },
+      ]
+    }
+
+    const [totalUsers, users] = await Promise.all([
+      User.countDocuments(filter),
+      User.find(filter)
+        .select(
+          "fullName email username phone avatar country role plan status kycStatus emailVerified createdAt updatedAt"
+        )
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+    ])
+
+    return res.status(200).json({
+      success: true,
+      users,
+      pagination: {
+        totalUsers,
+        page,
+        limit,
+        totalPages: Math.max(Math.ceil(totalUsers / limit), 1),
+      },
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch users",
+      error: error.message,
+    })
+  }
+})
+
+router.get("/admin/users/:id", adminAuthMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id).select(
+      "fullName email username phone bio avatar country role plan status kycStatus emailVerified kycCurrentSubmission kycVerifiedAt blockedUsers createdAt updatedAt"
+    )
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" })
+    }
+
+    const [followersCount, followingCount] = await Promise.all([
+      Follow.countDocuments({ following: user._id }),
+      Follow.countDocuments({ follower: user._id }),
+    ])
+
+    return res.status(200).json({
+      success: true,
+      user,
+      followersCount,
+      followingCount,
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch user details",
+      error: error.message,
+    })
+  }
+})
+
+router.patch("/admin/users/:id/status", adminAuthMiddleware, async (req, res) => {
+  try {
+    const { status } = req.body
+    const allowedStatuses = ["active", "suspended", "deactivated"]
+
+    if (!status || !allowedStatuses.includes(status)) {
+      return res.status(400).json({
+        message: "A valid status is required",
+        allowedStatuses,
+      })
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { $set: { status } },
+      { new: true }
+    ).select("fullName email username status role plan emailVerified kycStatus updatedAt")
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" })
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "User status updated successfully",
+      user,
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to update user status",
+      error: error.message,
+    })
+  }
+})
+
+router.delete("/admin/users/:id", adminAuthMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id).select("_id fullName email username")
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" })
+    }
+
+    const [ownedProperties, ownedRequests, userConversations, authoredComments, authoredDiscussions, userOrders] = await Promise.all([
+      Property.find({ owner: user._id }).select("_id"),
+      Request.find({ requester: user._id }).select("_id"),
+      Conversation.find({ participants: user._id }).select("_id"),
+      Comment.find({ author: user._id }).select("_id"),
+      Discussion.find({ author: user._id }).select("_id"),
+      Order.find({ $or: [{ buyer: user._id }, { seller: user._id }] }).select("_id"),
+    ])
+
+    const propertyIds = ownedProperties.map((property) => property._id)
+    const requestIds = ownedRequests.map((request) => request._id)
+    const conversationIds = userConversations.map((conversation) => conversation._id)
+    const commentIds = authoredComments.map((comment) => comment._id)
+    const discussionIds = authoredDiscussions.map((discussion) => discussion._id)
+    const orderIds = userOrders.map((order) => order._id)
+
+    await Promise.allSettled([
+      Follow.deleteMany({ $or: [{ follower: user._id }, { following: user._id }] }),
+      Property.deleteMany({ owner: user._id }),
+      Request.deleteMany({ requester: user._id }),
+      Comment.deleteMany({ author: user._id }),
+      Discussion.deleteMany({ author: user._id }),
+      RequestResponse.deleteMany({ author: user._id }),
+      Comment.deleteMany({ property: { $in: propertyIds } }),
+      Discussion.deleteMany({ request: { $in: requestIds } }),
+      RequestResponse.deleteMany({ request: { $in: requestIds } }),
+      Order.deleteMany({
+        $or: [
+          { buyer: user._id },
+          { seller: user._id },
+          { property: { $in: propertyIds } },
+        ],
+      }),
+      Bookmark.deleteMany({
+        $or: [
+          { user: user._id },
+          { targetType: "Property", targetId: { $in: propertyIds } },
+          { targetType: "Request", targetId: { $in: requestIds } },
+          { targetType: "Comment", targetId: { $in: commentIds } },
+          { targetType: "Discussion", targetId: { $in: discussionIds } },
+        ],
+      }),
+      Notification.deleteMany({
+        $or: [
+          { recipient: user._id },
+          { sender: user._id },
+          { targetType: "Property", targetId: { $in: propertyIds } },
+          { targetType: "Request", targetId: { $in: requestIds } },
+          { targetType: "Order", targetId: { $in: orderIds } },
+          { targetType: "Comment", targetId: { $in: commentIds } },
+          { targetType: "Discussion", targetId: { $in: discussionIds } },
+        ],
+      }),
+      Report.deleteMany({
+        $or: [
+          { reporter: user._id },
+          { reviewedBy: user._id },
+          { targetType: "user", targetId: user._id },
+          { targetType: "property", targetId: { $in: propertyIds } },
+          { targetType: "request", targetId: { $in: requestIds } },
+          { targetType: "order", targetId: { $in: orderIds } },
+        ],
+      }),
+      Message.deleteMany({ sender: user._id }),
+      Message.deleteMany({ conversation: { $in: conversationIds } }),
+      Conversation.deleteMany({ _id: { $in: conversationIds } }),
+    ])
+
+    await User.findByIdAndDelete(user._id)
+
+    return res.status(200).json({
+      success: true,
+      message: "User deleted successfully",
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to delete user",
+      error: error.message,
+    })
+  }
+})
+ 
 module.exports = router

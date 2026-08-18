@@ -110,6 +110,29 @@ const userSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    // Bachs subscription management fields.
+    bachsCustomerId: { 
+      type: String, 
+      default: null 
+    },
+    subscription: {
+      id: { 
+        type: String, 
+        default: null 
+      }, 
+      status: { 
+        type: String, 
+        default: null 
+      },
+      productId: { 
+        type: String, 
+        default: null 
+      },
+      currentPeriodEnd: { 
+        type: Date, 
+        default: null 
+      },
+    },
     // Users this account has blocked. Blocking is enforced server-side so
     // blocked chats cannot be re-opened or used to send new messages.
     blockedUsers: {

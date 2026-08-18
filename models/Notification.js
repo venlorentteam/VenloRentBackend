@@ -30,6 +30,7 @@ const notificationSchema = new mongoose.Schema(
         "response", // an agent responded to your request
         "order_placed", // a buyer placed an order on your listing
         "order_accepted", // seller accepted your order
+        "order_expired", // an order expired without payment
         "order_cancelled", // an order was cancelled
         "kyc_update", // KYC status changed
         "follow", // someone followed you

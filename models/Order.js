@@ -34,7 +34,7 @@ const orderSchema = new mongoose.Schema(
     // Business status of the order itself.
     status: {
       type: String,
-      enum: ["pending", "accepted", "rejected", "completed", "cancelled"],
+      enum: ["pending", "accepted", "rejected", "completed", "cancelled", "expired"],
       default: "pending",
       index: true,
     },

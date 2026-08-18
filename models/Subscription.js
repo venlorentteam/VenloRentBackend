@@ -44,16 +44,16 @@ const subscriptionSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
-    provider: {
-      type: String,
-      default: "manual",
-      trim: true,
-    },
-    providerReference: {
-      type: String,
-      trim: true,
-      default: "",
-    },
+    // provider: {
+    //   type: String,
+    //   default: "manual",
+    //   trim: true,
+    // },
+    // providerReference: {
+    //   type: String,
+    //   trim: true,
+    //   default: "",
+    // },
     metadata: {
       type: mongoose.Schema.Types.Mixed,
       default: {},
