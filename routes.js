@@ -3568,6 +3568,8 @@ router.get("/admin/dashboard/overview", adminAuthMiddleware, async (req, res) =>
 
 router.get("/admin/orders", adminAuthMiddleware, async (req, res) => {
   try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1)
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 100)
     const status = normalize(req.query.status || "")
     const search = normalize(req.query.search || "")
     const allowedStatuses = new Set(["pending", "accepted", "rejected", "completed", "cancelled", "expired"])
@@ -3603,7 +3605,13 @@ router.get("/admin/orders", adminAuthMiddleware, async (req, res) => {
         })
       : orders
 
-    const mappedOrders = filteredOrders.map((order) => {
+    const totalOrders = filteredOrders.length
+    const totalPages = Math.max(Math.ceil(totalOrders / limit), 1)
+    const currentPage = Math.min(page, totalPages)
+    const start = (currentPage - 1) * limit
+    const pageOrders = filteredOrders.slice(start, start + limit)
+
+    const mappedOrders = pageOrders.map((order) => {
       const buyer = order.buyer || {}
       const seller = order.seller || {}
 
@@ -3627,10 +3635,29 @@ router.get("/admin/orders", adminAuthMiddleware, async (req, res) => {
       }
     })
 
+    const lowerStatuses = filteredOrders.map((order) => normalize(order.status || ""))
+    const completedOrders = lowerStatuses.filter((value) => value === "completed").length
+    const pendingOrders = lowerStatuses.filter((value) => value === "pending" || value === "accepted").length
+    const cancelledOrders = lowerStatuses.filter(
+      (value) => value === "cancelled" || value === "rejected" || value === "expired"
+    ).length
+
     return res.status(200).json({
       success: true,
+      items: mappedOrders,
       orders: mappedOrders,
-      totalOrders: mappedOrders.length,
+      pagination: {
+        page: currentPage,
+        limit,
+        totalItems: totalOrders,
+        totalPages,
+      },
+      summary: {
+        totalOrders,
+        completedOrders,
+        pendingOrders,
+        cancelledOrders,
+      },
     })
   } catch (error) {
     return res.status(500).json({
