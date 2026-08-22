@@ -148,6 +148,19 @@ const formatRelativeTime = (dateLike) => {
   return `${diffDays}d ago`
 }
 
+const formatLocationLabel = (location = {}) =>
+  [location?.town, location?.state].filter(Boolean).join(", ") || "N/A"
+
+const mapRequestDisplayStatus = (request = {}) => {
+  const normalizedStatus = normalize(request.status || "")
+  if (normalizedStatus === "open") {
+    return Number(request.responseCount || 0) > 0 ? "Matched" : "Open"
+  }
+  if (normalizedStatus === "closed") return "Closed"
+  if (normalizedStatus === "expired") return "Expired"
+  return toTitleCase(normalizedStatus || "Open")
+}
+
 // Helper for Payout Details check
   const hasCompletePayoutDetails = (payoutDetails = {}) =>
     ["bankName", "accountName", "accountNumber", "payoutMethod"].every(
@@ -3662,6 +3675,391 @@ router.get("/admin/orders", adminAuthMiddleware, async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       message: "Failed to fetch admin orders",
+      error: error.message,
+    })
+  }
+})
+
+router.get("/admin/kyc", adminAuthMiddleware, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1)
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 100)
+    const status = normalize(req.query.status || "")
+    const search = normalize(req.query.search || "")
+    const allowedStatuses = new Set(["submitted", "in_review", "verified", "rejected"])
+
+    const query = {}
+    if (status && status !== "all") {
+      if (!allowedStatuses.has(status)) {
+        return res.status(400).json({
+          message: "Invalid KYC status filter",
+          allowedStatuses: Array.from(allowedStatuses),
+        })
+      }
+      query.status = status
+    }
+
+    const submissions = await KycSubmission.find(query)
+      .sort({ submittedAt: -1, createdAt: -1 })
+      .populate("user", "fullName username email avatar role kycStatus createdAt")
+
+    const filteredSubmissions = search
+      ? submissions.filter((submission) => {
+          const user = submission.user || {}
+          return [
+            normalize(submission.businessName || ""),
+            normalize(submission.officeAddress || ""),
+            normalize(submission.status || ""),
+            normalize(submission.diditSessionId || ""),
+            normalize(user.fullName || ""),
+            normalize(user.username || ""),
+            normalize(user.email || ""),
+          ].some((field) => field.includes(search))
+        })
+      : submissions
+
+    const totalItems = filteredSubmissions.length
+    const totalPages = Math.max(Math.ceil(totalItems / limit), 1)
+    const currentPage = Math.min(page, totalPages)
+    const pageItems = filteredSubmissions.slice((currentPage - 1) * limit, (currentPage - 1) * limit + limit)
+
+    const items = pageItems.map((submission) => {
+      const user = submission.user || {}
+      const normalizedStatus = normalize(submission.status)
+      const isApproved = normalizedStatus === "verified"
+      const isRejected = normalizedStatus === "rejected"
+
+      return {
+        id: submission._id.toString(),
+        applicantName: user.fullName || submission.businessName || "KYC applicant",
+        username: user.username || "",
+        email: user.email || "",
+        businessName: submission.businessName || "",
+        officeAddress: submission.officeAddress || "",
+        yearsExperience: submission.yearsExperience || "",
+        location: submission.officeAddress || user.country || "Nigeria",
+        submittedAt: formatRelativeTime(submission.submittedAt || submission.createdAt),
+        rawSubmittedAt: submission.submittedAt || submission.createdAt,
+        status: normalizedStatus || "submitted",
+        livenessCheck: isApproved ? "passed" : isRejected ? "failed" : "pending",
+        idVerification: isApproved ? "passed" : isRejected ? "failed" : "pending",
+        proofOfAddress: submission.addressProof?.url
+          ? "passed"
+          : isApproved
+          ? "passed"
+          : isRejected
+          ? "failed"
+          : "pending",
+        diditUrl: submission.diditUrl || "",
+        diditSessionId: submission.diditSessionId || "",
+        addressProof: submission.addressProof || null,
+        userId: user._id?.toString?.() || "",
+      }
+    })
+
+    const normalizedStatuses = filteredSubmissions.map((submission) => normalize(submission.status || ""))
+    const pendingKyc = normalizedStatuses.filter((value) => value === "submitted" || value === "in_review").length
+    const approvedKyc = normalizedStatuses.filter((value) => value === "verified").length
+    const rejectedKyc = normalizedStatuses.filter((value) => value === "rejected").length
+
+    return res.status(200).json({
+      success: true,
+      items,
+      pagination: {
+        page: currentPage,
+        limit,
+        totalItems,
+        totalPages,
+      },
+      summary: {
+        totalKyc: totalItems,
+        pendingKyc,
+        approvedKyc,
+        rejectedKyc,
+      },
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch admin KYC applications",
+      error: error.message,
+    })
+  }
+})
+
+router.patch("/admin/kyc/:id/status", adminAuthMiddleware, async (req, res) => {
+  try {
+    const { status } = req.body
+    const allowedStatuses = new Set(["in_review", "verified", "rejected"])
+    const normalizedStatus = normalize(status || "")
+
+    if (!allowedStatuses.has(normalizedStatus)) {
+      return res.status(400).json({
+        message: "Invalid KYC status",
+        allowedStatuses: Array.from(allowedStatuses),
+      })
+    }
+
+    const submission = await KycSubmission.findById(req.params.id)
+    if (!submission) {
+      return res.status(404).json({ message: "KYC submission not found" })
+    }
+
+    submission.status = normalizedStatus
+    await submission.save()
+
+    const userUpdate = {
+      kycStatus: normalizedStatus,
+      kycCurrentSubmission: submission._id,
+    }
+
+    if (normalizedStatus === "verified") {
+      userUpdate.kycVerifiedAt = new Date()
+    } else {
+      userUpdate.kycVerifiedAt = null
+    }
+
+    await User.findByIdAndUpdate(submission.user, userUpdate)
+
+    const updatedSubmission = await KycSubmission.findById(submission._id)
+      .populate("user", "fullName username email avatar role kycStatus createdAt")
+
+    return res.status(200).json({
+      success: true,
+      message: `KYC application marked as ${normalizedStatus.replace("_", " ")}`,
+      submission: updatedSubmission,
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to update KYC application",
+      error: error.message,
+    })
+  }
+})
+
+router.get("/admin/kyc/:id", adminAuthMiddleware, async (req, res) => {
+  try {
+    const submission = await KycSubmission.findById(req.params.id)
+      .populate("user", "fullName username email avatar role kycStatus createdAt")
+
+    if (!submission) {
+      return res.status(404).json({ message: "KYC submission not found" })
+    }
+
+    return res.status(200).json({
+      success: true,
+      submission,
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch KYC application",
+      error: error.message,
+    })
+  }
+})
+
+router.get("/admin/listings", adminAuthMiddleware, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1)
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 100)
+    const status = normalize(req.query.status || "")
+    const search = normalize(req.query.search || "")
+    const allowedStatuses = new Set(["approved", "pending", "flagged", "rejected"])
+
+    const query = {}
+    if (status && status !== "all") {
+      if (!allowedStatuses.has(status)) {
+        return res.status(400).json({
+          message: "Invalid listing moderation status",
+          allowedStatuses: Array.from(allowedStatuses),
+        })
+      }
+      query.moderationStatus = status
+    }
+
+    const properties = await Property.find(query)
+      .sort({ createdAt: -1 })
+      .populate("owner", "fullName username avatar role plan kycStatus")
+
+    const filteredProperties = search
+      ? properties.filter((property) => {
+          const owner = property.owner || {}
+          return [
+            normalize(property.title || ""),
+            normalize(property.description || ""),
+            normalize(property.property_type || ""),
+            normalize(property.listing_type || ""),
+            normalize(property.moderationStatus || ""),
+            normalize(formatLocationLabel(property.location)),
+            normalize(owner.fullName || ""),
+            normalize(owner.username || ""),
+          ].some((field) => field.includes(search))
+        })
+      : properties
+
+    const totalItems = filteredProperties.length
+    const totalPages = Math.max(Math.ceil(totalItems / limit), 1)
+    const currentPage = Math.min(page, totalPages)
+    const pageItems = filteredProperties.slice((currentPage - 1) * limit, (currentPage - 1) * limit + limit)
+
+    const items = pageItems.map((property) => {
+      const owner = property.owner || {}
+      const locationLabel = formatLocationLabel(property.location)
+
+      return {
+        id: property._id.toString(),
+        title: property.title || "Listing",
+        description: property.description || "",
+        location: locationLabel,
+        owner: owner.fullName || owner.username || "Owner",
+        ownerUsername: owner.username || "",
+        image: property.media?.[0]?.url || "",
+        price: formatCurrency(property.amount),
+        rawPrice: property.amount,
+        status: toTitleCase(property.moderationStatus || "approved"),
+        moderationStatus: property.moderationStatus || "approved",
+        listingType: toTitleCase(property.listing_type || ""),
+        propertyType: toTitleCase(property.property_type || ""),
+        createdAt: formatRelativeTime(property.createdAt),
+        rawCreatedAt: property.createdAt,
+      }
+    })
+
+    const normalizedStatuses = filteredProperties.map((property) => normalize(property.moderationStatus || "approved"))
+    const totalListings = totalItems
+    const approvedListings = normalizedStatuses.filter((value) => value === "approved").length
+    const pendingListings = normalizedStatuses.filter((value) => value === "pending").length
+    const flaggedListings = normalizedStatuses.filter((value) => value === "flagged").length
+    const rejectedListings = normalizedStatuses.filter((value) => value === "rejected").length
+
+    return res.status(200).json({
+      success: true,
+      items,
+      pagination: {
+        page: currentPage,
+        limit,
+        totalItems,
+        totalPages,
+      },
+      summary: {
+        totalListings,
+        approvedListings,
+        pendingListings,
+        flaggedListings,
+        rejectedListings,
+      },
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch admin listings",
+      error: error.message,
+    })
+  }
+})
+
+router.get("/admin/requests", adminAuthMiddleware, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1)
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 100)
+    const status = normalize(req.query.status || "")
+    const search = normalize(req.query.search || "")
+    const allowedStatuses = new Set(["all", "open", "matched", "closed", "expired"])
+
+    if (status && !allowedStatuses.has(status)) {
+      return res.status(400).json({
+        message: "Invalid request status filter",
+        allowedStatuses: Array.from(allowedStatuses),
+      })
+    }
+
+    const requestQuery = {}
+    if (status && status !== "all") {
+      if (status === "matched") {
+        requestQuery.status = "open"
+        requestQuery.responseCount = { $gt: 0 }
+      } else {
+        requestQuery.status = status
+      }
+    }
+
+    const requests = await Request.find(requestQuery)
+      .sort({ createdAt: -1 })
+      .populate("requester", "fullName username avatar role plan kycStatus")
+
+    const filteredRequests = search
+      ? requests.filter((request) => {
+          const requester = request.requester || {}
+          return [
+            normalize(request.description || ""),
+            normalize(request.category || ""),
+            normalize(formatLocationLabel(request.location)),
+            normalize(request.budget || ""),
+            normalize(request.status || ""),
+            normalize(requester.fullName || ""),
+            normalize(requester.username || ""),
+          ].some((field) => field.includes(search))
+        })
+      : requests
+
+    const totalItems = filteredRequests.length
+    const totalPages = Math.max(Math.ceil(totalItems / limit), 1)
+    const currentPage = Math.min(page, totalPages)
+    const pageItems = filteredRequests.slice((currentPage - 1) * limit, (currentPage - 1) * limit + limit)
+
+    const items = pageItems.map((request) => {
+      const requester = request.requester || {}
+      const locationLabel = formatLocationLabel(request.location)
+      const displayStatus = mapRequestDisplayStatus(request)
+
+      return {
+        id: request._id.toString(),
+        user: requester.fullName || requester.username || "Requester",
+        username: requester.username || "",
+        location: locationLabel,
+        category: request.category || "General",
+        budget: request.budget || "N/A",
+        status: displayStatus,
+        rawStatus: request.status || "open",
+        responseCount: request.responseCount || 0,
+        discussionCount: request.discussionCount || 0,
+        createdAt: formatRelativeTime(request.createdAt),
+        rawCreatedAt: request.createdAt,
+        expiresAt: request.expiresAt
+          ? new Date(request.expiresAt).toLocaleDateString("en-NG", {
+              day: "2-digit",
+              month: "short",
+              year: "numeric",
+            })
+          : "-",
+      }
+    })
+
+    const displayStatuses = filteredRequests.map((request) => mapRequestDisplayStatus(request))
+    const totalRequests = totalItems
+    const openRequests = displayStatuses.filter((value) => value === "Open").length
+    const matchedRequests = displayStatuses.filter((value) => value === "Matched").length
+    const closedRequests = displayStatuses.filter((value) => value === "Closed").length
+    const expiredRequests = displayStatuses.filter((value) => value === "Expired").length
+
+    return res.status(200).json({
+      success: true,
+      items,
+      pagination: {
+        page: currentPage,
+        limit,
+        totalItems,
+        totalPages,
+      },
+      summary: {
+        totalRequests,
+        openRequests,
+        matchedRequests,
+        closedRequests,
+        expiredRequests,
+      },
+    })
+  } catch (error) {
+    return res.status(500).json({
+      message: "Failed to fetch admin requests",
       error: error.message,
     })
   }
