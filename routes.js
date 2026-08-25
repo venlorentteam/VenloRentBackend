@@ -4065,6 +4065,126 @@ router.get("/admin/requests", adminAuthMiddleware, async (req, res) => {
   }
 })
 
+
+// ==================================================
+//  Moderation endpoints
+// ==================================================
+
+router.get("/admin/moderation", adminAuthMiddleware, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 100);
+    const search = (req.query.search || "").toLowerCase();
+    const status = req.query.status && req.query.status !== "all" ? req.query.status.toLowerCase() : null;
+    const type = req.query.type && req.query.type !== "all" ? req.query.type.toLowerCase() : null;
+
+    // 1. Fetch data
+    const reports = await Report.find({ status: { $in: ["open", "in_review"] } })
+      .populate("reporter", "fullName username");
+    const properties = await Property.find({
+      moderationStatus: { $in: ["pending", "flagged", "rejected"] },
+    })
+      .populate("owner", "fullName username");
+
+    // 2. Map to unified format
+    let flaggedItems = [
+      ...reports.map((report) => ({
+        id: `report-${report._id.toString()}`,
+        type: "Report",
+        target: report.targetId.toString().slice(-8), 
+        targetId: report.targetId,
+        targetType: report.targetType,
+        reason: report.reason,
+        reports: 1,
+        status: report.status,
+        createdAt: report.createdAt,
+      })),
+      ...properties.map((property) => ({
+        id: `property-${property._id.toString()}`,
+        type: "Property",
+        target: property.title,
+        targetId: property._id,
+        targetType: "property",
+        reason: property.moderationReasons?.[0] || "Marked for review",
+        reports: property.reportsCount || 0,
+        status: property.moderationStatus,
+        createdAt: property.updatedAt || property.createdAt,
+      })),
+    ];
+
+    // 3. Apply Filters
+    if (search) {
+      flaggedItems = flaggedItems.filter(item => 
+        item.target.toLowerCase().includes(search) || item.reason.toLowerCase().includes(search)
+      );
+    }
+    if (status) {
+      flaggedItems = flaggedItems.filter(item => item.status.toLowerCase() === status);
+    }
+    if (type) {
+      flaggedItems = flaggedItems.filter(item => item.type.toLowerCase() === type);
+    }
+
+    // 4. Sort and Paginate
+    flaggedItems.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    
+    const totalItems = flaggedItems.length;
+    const totalPages = Math.max(Math.ceil(totalItems / limit), 1);
+    const paginatedItems = flaggedItems.slice((page - 1) * limit, page * limit);
+
+    return res.status(200).json({ 
+      success: true, 
+      items: paginatedItems,
+      pagination: { page, limit, totalItems, totalPages }
+    });
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to fetch moderation queue", error: error.message });
+  }
+});
+
+// Endpoint to resolve a moderation item
+router.patch("/admin/moderation/:type/:id", adminAuthMiddleware, async (req, res) => {
+  try {
+    const { type, id } = req.params;
+    const { action, resolutionNote } = req.body; // action: 'approve', 'reject', 'dismiss', 'resolve'
+
+    if (type === "report") {
+      const report = await Report.findById(id);
+      if (!report) return res.status(404).json({ message: "Report not found" });
+
+      if (action === "dismiss") report.status = "dismissed";
+      else if (action === "resolve") {
+        report.status = "resolved";
+        report.resolutionNote = resolutionNote;
+      }
+      await report.save();
+    } else if (type === "property") {
+      const property = await Property.findById(id);
+      if (!property) return res.status(404).json({ message: "Property not found" });
+
+      if (action === "approve" || action === "dismiss") {
+        property.moderationStatus = "approved";
+        // Clear flags
+        property.reportsCount = 0;
+        property.moderationReasons = [];
+      } else if (action === "reject" || action === "remove") {
+        property.moderationStatus = "rejected";
+        // Archive the property so it's removed from active listings
+        property.status = "archived";
+      } else {
+        return res.status(400).json({ message: `Action '${action}' not supported for properties` });
+      }
+      await property.save();
+    } else {
+        return res.status(400).json({ message: "Invalid moderation type" });
+    }
+
+    return res.status(200).json({ success: true, message: "Action completed" });
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to perform moderation action", error: error.message });
+  }
+});
+
 router.get("/admin/users", adminAuthMiddleware, async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1)
