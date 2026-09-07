@@ -204,7 +204,7 @@ const renderWelcomeEmail = (fullName) => shell(`
   ${btn("Explore Listings", B.appUrl)}
 
   ${divider}
-  ${note("Questions? Visit our <a href='${B.helpUrl}' style='color:${B.primary};text-decoration:none;'>Help Center</a> or reply to this email and we'll be happy to help.")}
+  ${note(`Questions? Visit our <a href=${B.helpUrl} style='color:${B.primary};text-decoration:none;'>Help Center</a> or reply to this email and we'll be happy to help.`)}
 `)
 
 // ========================================
@@ -240,7 +240,7 @@ const renderPasswordResetEmail = (fullName, resetUrl) => shell(`
   </table>
 
   ${divider}
-  ${note("For security, never share this link. If you need help, contact us via our <a href='${B.helpUrl}' style='color:${B.primary};text-decoration:none;'>Help Center</a>.")}
+  ${note(`For security, never share this link. If you need help, contact us via our <a href=${B.helpUrl} style='color:${B.primary};text-decoration:none;'>Help Center</a>.`)}
 `)   // ← return added by removing the curly-brace body
 
 // ========================================
@@ -291,7 +291,7 @@ const renderPasswordChangedEmail = (fullName) => shell(`
   ${btn("Go to My Account", B.appUrl)}
 
   ${divider}
-  ${note("If you have questions or concerns, visit our <a href='${B.helpUrl}' style='color:${B.primary};text-decoration:none;'>Help Center</a>.")}
+  ${note(`If you have questions or concerns, visit our <a href=${B.helpUrl} style='color:${B.primary};text-decoration:none;'>Help Center</a>.`)}
 `)
 
 // ========================================
@@ -354,6 +354,66 @@ const renderListingOrderedEmail = ({
   ${note("If this order was unexpected, log in to your account to review the listing and order activity.")}
 `)
 
+// ========================================
+// 6. Subscription confirmed email
+// ========================================
+const renderSubscriptionConfirmedEmail = ({
+  fullName = "",
+  plan = "",
+  price = "",
+  billingCycle = "Monthly",
+  manageUrl = `${B.appUrl}/settings/subscription`,
+}) => {
+  const planLabel = plan ? plan.charAt(0).toUpperCase() + plan.slice(1) : "your new"
+
+  return shell(`
+    <!-- Status pill -->
+    <table cellpadding="0" cellspacing="0" border="0" role="presentation" style="margin:0 auto 20px;">
+      <tr>
+        <td style="background:#ecfdf5;border-radius:99px;padding:6px 16px;">
+          <p style="margin:0;font-size:12px;font-weight:600;color:${B.primaryDark};">Subscription active</p>
+        </td>
+      </tr>
+    </table>
+
+    ${h1(`You're now on the ${planLabel} plan`)}
+    ${lead(`Hi${fullName ? ` ${fullName}` : ""}, your upgrade to ${planLabel} was successful. Here's a quick summary of your subscription.`)}
+
+    <!-- Plan summary -->
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation"
+           style="background:${B.soft};border:1px solid ${B.border};border-radius:12px;margin:0 0 24px;">
+      <tr>
+        <td style="padding:18px;">
+          <p style="margin:0 0 10px;font-size:12px;font-weight:700;color:${B.muted};letter-spacing:0.8px;text-transform:uppercase;">
+            Subscription details
+          </p>
+
+          <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation">
+            <tr>
+              <td style="padding:6px 0;font-size:13px;color:${B.muted};width:130px;">Plan</td>
+              <td style="padding:6px 0;font-size:13px;font-weight:600;color:${B.dark};">${planLabel}</td>
+            </tr>
+            ${price ? `
+            <tr>
+              <td style="padding:6px 0;font-size:13px;color:${B.muted};width:130px;">Price</td>
+              <td style="padding:6px 0;font-size:13px;font-weight:600;color:${B.dark};">${price}</td>
+            </tr>` : ""}
+            <tr>
+              <td style="padding:6px 0;font-size:13px;color:${B.muted};width:130px;">Billing cycle</td>
+              <td style="padding:6px 0;font-size:13px;font-weight:600;color:${B.dark};">${billingCycle}</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+
+    ${btn("Manage Subscription", manageUrl)}
+
+    ${divider}
+    ${note(`Didn't expect this? You can review or cancel your subscription anytime from your account settings, or contact us via our <a href=${B.helpUrl} style='color:${B.primary};text-decoration:none;'>Help Center</a>.`)}
+  `)
+}
+
 module.exports = {
   getResendClient,
   renderOtpEmail,
@@ -361,4 +421,5 @@ module.exports = {
   renderPasswordResetEmail,
   renderPasswordChangedEmail,
   renderListingOrderedEmail,
+  renderSubscriptionConfirmedEmail,
 }

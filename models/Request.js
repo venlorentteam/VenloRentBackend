@@ -34,7 +34,7 @@ const requestSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["open", "closed", "expired"],
+      enum: ["open", "closed", "expired", "removed"],
       default: "open",
       index: true,
     },
@@ -60,6 +60,21 @@ const requestSchema = new mongoose.Schema(
       min: 0,
     },
     discussionCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    moderationStatus: {
+      type: String,
+      enum: ["approved", "flagged", "rejected"],
+      default: "approved",
+      index: true,
+    },
+    moderationReasons: {
+      type: [String],
+      default: [],
+    },
+    reportsCount: {
       type: Number,
       default: 0,
       min: 0,

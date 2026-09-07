@@ -3,7 +3,7 @@ const Bachs = require('@bachs/sdk')
 const crypto = require('crypto')
 
 function createBachsClient() {
-  const apiKey = process.env.BACHS_KEY_SANDBOX
+  const apiKey = process.env.BACHS_KEY
 
   // The published @bachs/sdk package is currently a placeholder that exports {}
   // instead of a constructor. Keep the app bootable and fail gracefully on the
@@ -60,12 +60,44 @@ function verifyBachsSignature(rawBody, secret, timestampHeader, signatureHeader,
 }
 
 const PLAN_PRODUCTS = {
-  pro: 'prod_pro_monthly',
-  premium: 'prod_premium_monthly',
+  pro: 'process.env.PRO_MONTHLY',
+  premium: 'process.env.PREMIUM_MONTHLY',
 }
 
 const PRODUCT_TO_PLAN = Object.fromEntries(
   Object.entries(PLAN_PRODUCTS).map(([plan, product]) => [product, plan])
 )
 
-module.exports = { bachs, getOrCreateBachsCustomer, verifyBachsSignature, PLAN_PRODUCTS, PRODUCT_TO_PLAN }
+// Plans caching and fetching helper
+let plansCache = { data: null, expiresAt: 0 }
+const PLANS_CACHE_TIME = 5 * 60 * 1000 // 5 minutes — prices rarely change
+
+async function getPlanPricing() {
+  if (plansCache.data && Date.now() < plansCache.expiresAt) {
+    return plansCache.data
+  }
+
+  const entries = await Promise.all(
+    Object.entries(PLAN_PRODUCTS).map(async ([key, productId]) => {
+      const product = await bachs.products.retrieve(productId)
+      return [
+        key,
+        {
+          key,
+          name: product.name,
+          price: Number(product.price ?? product.amount), // adjust to actual SDK field name once confirmed
+          currency: product.currency || 'NGN',
+          interval: product.recurring?.interval || 'month',
+        },
+      ]
+    })
+  )
+
+  plansCache = {
+    data: Object.fromEntries(entries),
+    expiresAt: Date.now() + PLANS_CACHE_TIME,
+  }
+  return plansCache.data
+}
+
+module.exports = { bachs, getOrCreateBachsCustomer, verifyBachsSignature, getPlanPricing, PLAN_PRODUCTS, PRODUCT_TO_PLAN }

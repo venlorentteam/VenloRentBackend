@@ -9,14 +9,33 @@ const subscriptionSchema = new mongoose.Schema(
       index: true,
     },
     plan: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Plan",
+      type: String,
+      enum: ["free", "pro", "premium"],
       required: true,
       index: true,
     },
+    bachsSubscriptionId: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+    },
+    bachsCustomerId: {
+      type: String,
+      required: true,
+      index: true,
+    },
+    bachsProductId: {
+      type: String,
+      required: true,
+    },
+    providerStatus: {
+      type: String,
+      trim: true, // raw string from Bachs — not enum-constrained, vocabulary unconfirmed
+    },
     status: {
       type: String,
-      enum: ["active", "trialing", "past_due", "cancelled", "expired"],
+      enum: ["active", "inactive"],
       default: "active",
       index: true,
     },
@@ -44,16 +63,6 @@ const subscriptionSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
-    // provider: {
-    //   type: String,
-    //   default: "manual",
-    //   trim: true,
-    // },
-    // providerReference: {
-    //   type: String,
-    //   trim: true,
-    //   default: "",
-    // },
     metadata: {
       type: mongoose.Schema.Types.Mixed,
       default: {},

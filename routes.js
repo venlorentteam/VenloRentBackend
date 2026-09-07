@@ -14,23 +14,27 @@ const RequestResponse = require("./models/RequestResponse")
 const Discussion = require("./models/Discussion")
 const KycSubmission = require("./models/KycSubmission")
 const Order = require("./models/Order")
-const PaymentTransaction = require("./models/PaymentTransaction")
+const Subscription = require("./models/Subscription.js")
+const SubscriptionPayment = require("./models/SubscriptionPayment.js")
 const Follow = require("./models/Follow")
 const Report = require("./models/Report")
 const Admin = require("./models/Admin")
 const Conversation = require("./models/Conversation")
 const Message = require("./models/Messages")
-const authMiddleware = require("./middleware/authMiddleware") //Token decrypter and userID extractor 
-const adminAuthMiddleware = require("./middleware/adminAuthMiddleware")
 const Notification = require("./models/Notification")
+const ProcessedWebhookEvent = require('./models/ProcessedWebhookEvent')
+
+//Middlewares
+const authMiddleware = require("./middleware/authMiddleware") //Token decrypter and userID extractor 
+const adminAuthMiddleware = require("./middleware/adminAuthMiddleware") 
 
 // Helpers
 const notify = require("./utility/notify")
 const { expireOverdueOrders, ORDER_WINDOW_HOURS, TERMINAL_ORDER_STATUSES } = require("./utility/orderLifecycle.js")
 const { expireOverdueRequests, isRequestExpired, REQUEST_WINDOW_DAYS } = require("./utility/requestLifecycle.js")
-const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail, renderListingOrderedEmail } = require("./emails")
+const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail, renderListingOrderedEmail, renderSubscriptionConfirmedEmail } = require("./emails")
 const { loginLimiter, otpLimiter, verifyLimiter, registerLimiter, passwordResetLimiter } = require('./utility/rateLimiters')
-const { bachs, verifyBachsSignature, getOrCreateBachsCustomer, PLAN_PRODUCTS, PRODUCT_TO_PLAN } = require('./utility/bachs')
+const { bachs, verifyBachsSignature, getOrCreateBachsCustomer, getPlanPricing, PLAN_PRODUCTS, PRODUCT_TO_PLAN } = require('./utility/bachs')
 const { cloudinary, avatarUpload, kycUpload, listingUpload } = require("./utility/cloudinary")
 
 require("dotenv").config()
@@ -420,7 +424,7 @@ router.post("/auth/email-verify", verifyLimiter, async (req, res) => {
     user.otpExpires = null
     await user.save()
 
-    // Send welcome email (best-effort)
+    // Send welcome email 
     try {
       const resend = getResendClient()
       await resend.emails.send({
@@ -1226,6 +1230,12 @@ router.post('/billing/checkout-session', authMiddleware, async (req, res) => {
       return res.status(404).json({ message: 'User not found' })
     }
 
+    if (user.subscription?.status === 'active') {
+      return res.status(409).json({
+        message: 'You already have an active subscription. Use "Manage billing" to change plans.',
+      })
+    }
+
     const customerId = await getOrCreateBachsCustomer(user)
 
     const session = await bachs.checkout.create({
@@ -1263,20 +1273,23 @@ router.post('/billing/webhook', async (req, res) => {
 
     const event = JSON.parse(req.body.toString('utf-8'))
 
-    // Dedupe — at-least-once delivery per Bachs docs
-    // try {
-    //   await ProcessedWebhookEvent.create({ eventId: event.id })
-    // } catch (err) {
-    //   if (err.code === 11000) return res.status(200).json({ received: true, duplicate: true })
-    //   throw err
-    // }
+    //Dedupe — at-least-once delivery per Bachs docs
+    try {
+      await ProcessedWebhookEvent.create({ eventId: event.id, type: event.type })
+    } catch (err) {
+      if (err.code === 11000) return res.status(200).json({ received: true, duplicate: true })
+      throw err
+    }
 
     switch (event.type) {
-      case 'customer.subscription.created':
-      case 'customer.subscription.updated': {
+      case 'subscription.created':
+      case 'subscription.updated': {
         const sub = event.data
         const resolvedPlan = sub.metadata?.plan || PRODUCT_TO_PLAN[sub.product] || 'free'
-        await User.findOneAndUpdate(
+
+        // { new: false } returns the doc as it was BEFORE this update —
+        // that's what lets us tell "renewal sync" apart from "actual upgrade."
+        const previousUser = await User.findOneAndUpdate(
           { bachsCustomerId: sub.customer },
           {
             plan: resolvedPlan,
@@ -1284,19 +1297,88 @@ router.post('/billing/webhook', async (req, res) => {
             'subscription.status': sub.status,
             'subscription.productId': sub.product,
             'subscription.currentPeriodEnd': sub.current_period_end,
-          }
+          },
+          { new: false }
         )
+        let subscriptionDoc = null;
+        if (previousUser) {
+          // Upsert on bachsSubscriptionId — safe against duplicate/retried webhook deliveries.
+          subscriptionDoc = await Subscription.findOneAndUpdate(
+            { bachsSubscriptionId: sub.id },
+            {
+              user: previousUser._id,
+              plan: resolvedPlan,
+              bachsSubscriptionId: sub.id,
+              bachsCustomerId: sub.customer,
+              bachsProductId: sub.product,
+              providerStatus: sub.status,
+              status: sub.status === 'active' ? 'active' : 'inactive', // adjust once real status vocab is confirmed
+              currentPeriodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null, // confirm unit: seconds vs ms vs ISO string
+            },
+            { upsert: true, new: true }
+          )
+        }
+
+        const planActuallyChanged = previousUser && previousUser.plan !== resolvedPlan
+
+        if (planActuallyChanged && resolvedPlan !== 'free' && subscriptionDoc) {
+          await SubscriptionPayment.create({
+            user: previousUser._id,
+            subscription: subscriptionDoc._id, // from the Subscription upsert above
+            bachsCustomerId: sub.customer,
+            bachsSubscriptionId: sub.id,
+            bachsEventId: event.id,
+            amount: sub.amount ?? 0, // still unconfirmed field — same caveat as before
+            plan: resolvedPlan,
+            status: sub.status,
+          })
+          try {
+            const resend = getResendClient()
+            await resend.emails.send({
+              from: process.env.AUTH_EMAIL,
+              to: previousUser.email,
+              subject: `You're now on the ${toTitleCase(resolvedPlan)} plan`,
+              html: renderSubscriptionConfirmedEmail({
+                fullName: previousUser.fullName,
+                plan: resolvedPlan,
+                // price is optional — only pass it if you already have it handy on `sub`
+              }),
+            })
+          } catch (emailError) {
+            console.error('Failed to send subscription confirmation email:', emailError.message)
+          }
+
+          await notify({
+            recipient: previousUser._id,
+            sender: null,
+            type: 'subscription_upgraded',
+            snapshot: { title: `Upgraded to ${toTitleCase(resolvedPlan)}` },
+          })
+        }
         break
       }
-      case 'customer.subscription.deleted': {
+      case 'subscription.canceled':
+      case 'subscription.deleted': {
         const sub = event.data
         await User.findOneAndUpdate(
           { bachsCustomerId: sub.customer },
           { plan: 'free', 'subscription.status': 'canceled' }
         )
+
+        // Mirror the cancellation onto the dedicated Subscription document too —
+        // without this, Subscription.status stays "active" forever, since only
+        // User ever learned about the cancellation.
+        await Subscription.findOneAndUpdate(
+          { bachsSubscriptionId: sub.id },
+          {
+            status: 'inactive',
+            cancelledAt: new Date(),
+          }
+        )
         break
       }
       default:
+        console.warn(`Unhandled Bachs webhook event: ${event.type}`)
         break
     }
 
@@ -1304,6 +1386,39 @@ router.post('/billing/webhook', async (req, res) => {
   } catch (err) {
     console.error('Bachs webhook error:', err.message)
     return res.status(200).json({ received: true })
+  }
+})
+
+/*===================================================
+  Bachs billing management and cancellation
+  ==================================================*/
+router.post('/billing/portal-session', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id)
+    if (!user?.bachsCustomerId) {
+      return res.status(400).json({ message: 'No billing profile found for this account' })
+    }
+
+    const portalSession = await bachs.customerSessions.create({
+      customer: user.bachsCustomerId,
+      return_url: `${process.env.APP_URL}/settings/subscription`,
+    })
+
+    return res.status(200).json({ success: true, portalUrl: portalSession.url })
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to open billing portal', error: error.message })
+  }
+})
+
+/*=======================================================================
+  Bachs Plan and Price Fetching from Bachs Dasboard instead of Hardcoding
+  =======================================================================*/
+router.get('/billing/plans', async (req, res) => {
+  try {
+    const plans = await getPlanPricing()
+    return res.status(200).json({ success: true, plans })
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch plans', error: error.message })
   }
 })
 
@@ -1777,7 +1892,9 @@ router.post("/create-request", authMiddleware, async (req, res) => {
 
     // Requests stay active for 30 days, then the lifecycle helper marks them expired.
     const expiresAt = new Date(Date.now() + REQUEST_WINDOW_DAYS * 24 * 60 * 60 * 1000)
-
+    
+    //Pre-publish banned-phrase check
+    const moderation = checkContentModeration({ title: "", description: description.toString() })
     const request = await Request.create({
       requester: req.user.id,
       description: description.toString().trim(),
@@ -1786,7 +1903,18 @@ router.post("/create-request", authMiddleware, async (req, res) => {
       budget: budget.toString().trim(),
       expiresAt,
       status: "open",
+      moderationStatus: moderation.isBlocked ? "rejected" : "approved",
+      moderationReasons: moderation.reasons,
     })
+
+    if (moderation.isBlocked) {
+      // it's created but held back from the public feed by the query filter below.
+      return res.status(201).json({
+        success: true,
+        message: "Request contains banned keywords and is under review",
+        request,
+      })
+    }
 
     return res.status(201).json({
       success: true,
@@ -1822,8 +1950,18 @@ router.get("/requests", async (req, res) => {
 
     const { status, page = 1, limit = 20 } = req.query
 
-    const query = {}
-    if (status) query.status = status
+    const query = {
+      $or: [
+        { moderationStatus: "approved" },
+        { moderationStatus: { $exists: false } },
+      ],
+    }
+
+    if (status && status !== "removed") {
+      query.status = status
+    } else if (!status) {
+      query.status = { $ne: "removed" }
+    }
 
     const safeLimit = Math.min(Number(limit) || 20, 50)
     const safePage = Math.max(Number(page) || 1, 1)
@@ -3255,7 +3393,7 @@ router.post("/requests/:id/report", authMiddleware, async (req, res) => {
       return res.status(400).json({ message: "Report details exceed the maximum length of 300 characters" })
     }
     
-    const request = await Request.findById(req.params.id).select("requester")
+    const request = await Request.findById(req.params.id).select("requester reportsCount moderationStatus moderationReasons")
     if (!request) {
       return res.status(404).json({ message: "Request not found" })
     }
@@ -3264,7 +3402,15 @@ router.post("/requests/:id/report", authMiddleware, async (req, res) => {
       return res.status(400).json({ message: "You cannot report your own request" })
     }
 
-    // Request schema has no reportsCount or reports array — only create the Report document
+    const alreadyReported = await Report.exists({
+      reporter: req.user.id,
+      targetType: "request",
+      targetId: request._id,
+    })
+    if (alreadyReported) {
+      return res.status(409).json({ message: "You have already reported this request" })
+    }
+
     await Report.create({
       reporter: req.user.id,
       targetType: "request", 
@@ -3272,6 +3418,19 @@ router.post("/requests/:id/report", authMiddleware, async (req, res) => {
       reason,
       details: details.toString().trim().slice(0, 300),
     })
+
+    // Same threshold/shape as Property's auto-flag.
+    request.reportsCount = Number(request.reportsCount || 0) + 1
+
+    if (request.reportsCount >= 5 && request.moderationStatus === "approved") {
+      request.moderationStatus = "flagged"
+      request.moderationReasons = [
+        ...(request.moderationReasons || []),
+        "Auto-flagged due to user reports",
+      ]
+    }
+
+    await request.save()
 
     return res.status(200).json({ success: true, message: "Report submitted" })
   } catch (error) {
@@ -3390,7 +3549,7 @@ router.get("/admin/dashboard/overview", adminAuthMiddleware, async (req, res) =>
       KycSubmission.countDocuments({ status: { $in: ["submitted", "in_review"] } }),
       Order.countDocuments({ status: "completed" }),
       Property.countDocuments({}),
-      PaymentTransaction.countDocuments({}),
+      SubscriptionPayment.countDocuments({}),
       Report.countDocuments({ status: { $in: ["open", "in_review"] } }),
       Property.countDocuments({ moderationStatus: { $in: ["pending", "flagged", "rejected"] } }),
       KycSubmission.find()
@@ -3403,12 +3562,10 @@ router.get("/admin/dashboard/overview", adminAuthMiddleware, async (req, res) =>
         .populate("property", "title amount location")
         .populate("buyer", "fullName username")
         .populate("seller", "fullName username"),
-      PaymentTransaction.find()
-        .sort({ createdAt: -1 })
-        .limit(5)
-        .populate("order", "property amount status createdAt")
-        .populate("payer", "fullName username")
-        .populate("payee", "fullName username"),
+      SubscriptionPayment.find()
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .populate("user", "fullName username"),
       Report.find({ status: { $in: ["open", "in_review"] } })
         .sort({ createdAt: -1 })
         .limit(5)
@@ -3471,21 +3628,16 @@ router.get("/admin/dashboard/overview", adminAuthMiddleware, async (req, res) =>
       }
     })
 
-    const payments = recentPayments.map((payment) => {
-      const payer = payment.payer || {}
-      const payee = payment.payee || {}
-
-      return {
-        id: payment._id.toString(),
-        orderId: payment.order?._id?.toString?.() || payment.order?.toString?.() || payment.order,
-        customer: payer.fullName || payer.username || "Payer",
-        agent: payee.fullName || payee.username || "Payee",
-        amount: formatCurrency(payment.amount),
-        gateway: toTitleCase(payment.method),
-        status: toTitleCase(payment.status),
-        date: formatRelativeTime(payment.createdAt),
-      }
-    })
+    const payments = recentPayments.map((payment) => ({
+      id: payment._id.toString(),
+      orderId: `Subscription (${toTitleCase(payment.plan)})`, // no Order — replaces the old orderId slot
+      customer: payment.user?.fullName || payment.user?.username || "Customer",
+      agent: "VenloRent", // platform revenue, not a seller payout — replaces the old "agent"/payee slot
+      amount: formatCurrency(payment.amount),
+      gateway: "Bachs",
+      status: toTitleCase(payment.status || "successful"),
+      date: formatRelativeTime(payment.createdAt),
+    }))
 
     const flaggedItems = [
       ...recentReports.map((report) => ({
@@ -3535,7 +3687,7 @@ router.get("/admin/dashboard/overview", adminAuthMiddleware, async (req, res) =>
       ...recentPayments.map((payment) => ({
         sortAt: new Date(payment.createdAt).getTime(),
         action: `Payment ${toTitleCase(payment.status).toLowerCase()}`,
-        user: payment.payer?.fullName || payment.payer?.username || "Payment participant",
+        user: payment.user?.fullName || payment.user?.username || "Payment participant",
       })),
       ...recentReports.map((report) => ({
         sortAt: new Date(report.createdAt).getTime(),
@@ -4080,23 +4232,41 @@ router.get("/admin/moderation", adminAuthMiddleware, async (req, res) => {
 
     // 1. Fetch data
     const reports = await Report.find({ status: { $in: ["open", "in_review"] } })
-      .populate("reporter", "fullName username");
+    .populate("reporter", "fullName username");
     const properties = await Property.find({
       moderationStatus: { $in: ["pending", "flagged", "rejected"] },
     })
-      .populate("owner", "fullName username");
+    .populate("owner", "fullName username");
+    const flaggedRequests = await Request.find({
+      moderationStatus: { $in: ["flagged", "rejected"] },
+    })
+    .populate("requester", "fullName username");
 
-    // 2. Map to unified format
+    // Resolve a human-readable label for each report's target before mapping.
+    const reportTargetLabels = await Promise.all(
+      reports.map(async (report) => {
+        if (report.targetType === "property") {
+          const p = await Property.findById(report.targetId).select("title")
+          return p?.title || "Deleted listing"
+        }
+        if (report.targetType === "request") {
+          const r = await Request.findById(report.targetId).select("description")
+          return r?.description?.slice(0, 60) || "Deleted request"
+        }
+        return `Conversation ${report.targetId.toString().slice(-8)}`
+      })
+    )
+
     let flaggedItems = [
-      ...reports.map((report) => ({
+      ...reports.map((report, i) => ({
         id: `report-${report._id.toString()}`,
         type: "Report",
-        target: report.targetId.toString().slice(-8), 
+        target: reportTargetLabels[i],
         targetId: report.targetId,
         targetType: report.targetType,
         reason: report.reason,
         reports: 1,
-        status: report.status,
+        status: report.status, // raw value — kept lowercase for the filter step below
         createdAt: report.createdAt,
       })),
       ...properties.map((property) => ({
@@ -4107,10 +4277,21 @@ router.get("/admin/moderation", adminAuthMiddleware, async (req, res) => {
         targetType: "property",
         reason: property.moderationReasons?.[0] || "Marked for review",
         reports: property.reportsCount || 0,
-        status: property.moderationStatus,
+        status: property.moderationStatus, // raw value — kept lowercase for the filter step below
         createdAt: property.updatedAt || property.createdAt,
       })),
-    ];
+      ...flaggedRequests.map((request) => ({
+        id: `request-${request._id.toString()}`,
+        type: "Request",
+        target: request.description?.slice(0, 60) || "Flagged request",
+        targetId: request._id,
+        targetType: "request",
+        reason: request.moderationReasons?.[0] || "Marked for review",
+        reports: request.reportsCount || 0,
+        status: request.moderationStatus,
+        createdAt: request.updatedAt || request.createdAt,
+      })),
+    ]
 
     // 3. Apply Filters
     if (search) {
@@ -4127,16 +4308,18 @@ router.get("/admin/moderation", adminAuthMiddleware, async (req, res) => {
 
     // 4. Sort and Paginate
     flaggedItems.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    
+
     const totalItems = flaggedItems.length;
     const totalPages = Math.max(Math.ceil(totalItems / limit), 1);
-    const paginatedItems = flaggedItems.slice((page - 1) * limit, page * limit);
+    const paginatedItems = flaggedItems
+      .slice((page - 1) * limit, page * limit)
+      .map((item) => ({ ...item, status: toTitleCase(item.status) })) // title-case only at output, after filtering
 
     return res.status(200).json({ 
       success: true, 
       items: paginatedItems,
       pagination: { page, limit, totalItems, totalPages }
-    });
+    })
   } catch (error) {
     return res.status(500).json({ message: "Failed to fetch moderation queue", error: error.message });
   }
@@ -4146,35 +4329,97 @@ router.get("/admin/moderation", adminAuthMiddleware, async (req, res) => {
 router.patch("/admin/moderation/:type/:id", adminAuthMiddleware, async (req, res) => {
   try {
     const { type, id } = req.params;
-    const { action, resolutionNote } = req.body; // action: 'approve', 'reject', 'dismiss', 'resolve'
+    const { action, resolutionNote } = req.body;
 
     if (type === "report") {
       const report = await Report.findById(id);
       if (!report) return res.status(404).json({ message: "Report not found" });
 
-      if (action === "dismiss") report.status = "dismissed";
-      else if (action === "resolve") {
+      if (action === "dismiss") {
+        report.status = "dismissed";
+      } else if (action === "resolve") {
         report.status = "resolved";
         report.resolutionNote = resolutionNote;
+
+        // Cascade: a validated report ESCALATES the target for review — it does not
+        // unilaterally take content down. A single resolved report should never
+        // silently archive/remove something; only the dedicated Property/Request
+        // action (approve/reject on that item's own card) does that.
+        if (report.targetType === "property") {
+          const property = await Property.findById(report.targetId).select("moderationStatus");
+          if (property && property.moderationStatus === "approved") {
+            await Property.findByIdAndUpdate(report.targetId, {
+              moderationStatus: "flagged",
+              $addToSet: { moderationReasons: "Report validated by admin" },
+            });
+          }
+        } else if (report.targetType === "request") {
+          const request = await Request.findById(report.targetId).select("moderationStatus");
+          if (request && request.moderationStatus === "approved") {
+            await Request.findByIdAndUpdate(report.targetId, {
+              moderationStatus: "flagged",
+              $addToSet: { moderationReasons: "Report validated by admin" },
+            });
+          }
+        } else if (report.targetType === "message") {
+          const conversation = await Conversation.findById(report.targetId).select("participants");
+          report.metadata = { participants: conversation?.participants || [] };
+        }
+      } else {
+        return res.status(400).json({ message: `Action '${action}' not supported for reports` });
       }
       await report.save();
+
     } else if (type === "property") {
+      //const { action, resolutionNote } = req.body;
       const property = await Property.findById(id);
       if (!property) return res.status(404).json({ message: "Property not found" });
 
+      let cascadeReportStatus;
       if (action === "approve" || action === "dismiss") {
         property.moderationStatus = "approved";
-        // Clear flags
         property.reportsCount = 0;
         property.moderationReasons = [];
+        cascadeReportStatus = "dismissed"; // content was fine — the complaints about it weren't valid
       } else if (action === "reject" || action === "remove") {
         property.moderationStatus = "rejected";
-        // Archive the property so it's removed from active listings
         property.status = "archived";
+        cascadeReportStatus = "resolved"; // content was bad — the complaints were valid
       } else {
         return res.status(400).json({ message: `Action '${action}' not supported for properties` });
       }
       await property.save();
+
+      // Close out every still-open Report pointing at this property, so acting on
+      // the auto-flagged card doesn't leave its underlying complaints stuck at "open".
+      await Report.updateMany(
+        { targetType: "property", targetId: property._id, status: { $in: ["open", "in_review"] } },
+        { $set: { status: cascadeReportStatus, ...(resolutionNote ? { resolutionNote } : {}) } }
+      );
+
+    } else if (type === "request") {
+      const request = await Request.findById(id);
+      if (!request) return res.status(404).json({ message: "Request not found" });
+
+      let cascadeReportStatus;
+      if (action === "approve" || action === "dismiss") {
+        request.moderationStatus = "approved";
+        request.reportsCount = 0;
+        request.moderationReasons = [];
+        cascadeReportStatus = "dismissed";
+      } else if (action === "reject" || action === "remove") {
+        request.moderationStatus = "rejected";
+        request.status = "removed";
+        cascadeReportStatus = "resolved";
+      } else {
+        return res.status(400).json({ message: `Action '${action}' not supported for requests` });
+      }
+      await request.save();
+
+      await Report.updateMany(
+        { targetType: "request", targetId: request._id, status: { $in: ["open", "in_review"] } },
+        { $set: { status: cascadeReportStatus, ...(resolutionNote ? { resolutionNote } : {}) } }
+      );
     } else {
         return res.status(400).json({ message: "Invalid moderation type" });
     }
@@ -4183,7 +4428,7 @@ router.patch("/admin/moderation/:type/:id", adminAuthMiddleware, async (req, res
   } catch (error) {
     return res.status(500).json({ message: "Failed to perform moderation action", error: error.message });
   }
-});
+})
 
 router.get("/admin/users", adminAuthMiddleware, async (req, res) => {
   try {

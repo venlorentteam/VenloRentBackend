@@ -133,6 +133,26 @@ const userSchema = new mongoose.Schema(
         default: null 
       },
     },
+    isSuspended: { 
+      type: Boolean, 
+      default: false 
+    },
+    suspendedUntil: { 
+      type: Date, 
+      default: null 
+    },
+    suspensionReason: { 
+      type: String, 
+      default: "" 
+    },
+    moderationHistory: [
+      { 
+        action: String, 
+        reason: String, 
+        by: mongoose.Schema.Types.ObjectId, 
+        at: Date 
+      }
+    ],
     // Users this account has blocked. Blocking is enforced server-side so
     // blocked chats cannot be re-opened or used to send new messages.
     blockedUsers: {
