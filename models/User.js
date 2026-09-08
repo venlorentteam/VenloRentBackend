@@ -222,6 +222,6 @@ userSchema.methods.comparePassword = async function (plainPassword) {
   return bcrypt.compare(plainPassword, this.password)
 }
 
-const User = mongoose.model("User", userSchema, "users")//First=> Model Name, Second=>Schema, Third=>Collection Name (optional, defaults to pluralized model name)
+const User = mongoose.model("User", userSchema, "users")
 
 module.exports = User

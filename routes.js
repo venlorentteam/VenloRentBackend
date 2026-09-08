@@ -103,6 +103,8 @@ const BANNED_TERMS = [
   "crypto only",
   "urgent payment",
   "whatsapp",
+  "telegram",
+  "call me",
 ]
 
 // Normalizes text for case-insensitive moderation checks.
@@ -4006,6 +4008,73 @@ router.get("/admin/kyc/:id", adminAuthMiddleware, async (req, res) => {
       message: "Failed to fetch KYC application",
       error: error.message,
     })
+  }
+})
+
+router.get("/admin/payments", adminAuthMiddleware, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1)
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 100)
+    const status = normalize(req.query.status || "")
+    const search = normalize(req.query.search || "")
+
+    const query = {}
+    if (status && status !== "all") {
+      query.status = status
+    }
+
+    const transactions = await SubscriptionPayment.find(query)
+      .sort({ createdAt: -1 })
+      .populate("user", "fullName username")
+
+    const filteredTransactions = search
+      ? transactions.filter((txn) => {
+          const user = txn.user || {}
+          return [
+            normalize(txn._id.toString()),
+            normalize(user.fullName || ""),
+            normalize(user.username || ""),
+            normalize(txn.plan || ""),
+            normalize(txn.status || ""),
+          ].some((field) => field.includes(search))
+        })
+      : transactions
+
+    const totalItems = filteredTransactions.length
+    const totalPages = Math.max(Math.ceil(totalItems / limit), 1)
+    const currentPage = Math.min(page, totalPages)
+    const pageItems = filteredTransactions.slice((currentPage - 1) * limit, (currentPage - 1) * limit + limit)
+
+    const items = pageItems.map((txn) => {
+      const user = txn.user || {}
+
+      return {
+        id: txn._id.toString(),
+        orderId: `Subscription (${toTitleCase(txn.plan)})`, // no Order — subscription charges have none
+        customer: user.fullName || user.username || "Customer",
+        amount: formatCurrency(txn.amount),
+        gateway: "Bachs",
+        status: toTitleCase(txn.status || "successful"),
+        rawStatus: txn.status || "successful",
+        date: formatRelativeTime(txn.createdAt),
+      }
+    })
+
+    const normalizedStatuses = filteredTransactions.map((txn) => normalize(txn.status || ""))
+    const totalPayments = totalItems
+    const successfulPayments = normalizedStatuses.filter((v) => v === "successful" || v === "active").length
+    const pendingPayments = normalizedStatuses.filter((v) => v === "pending").length
+    const failedPayments = normalizedStatuses.filter((v) => v === "failed").length
+    const refundedPayments = normalizedStatuses.filter((v) => v === "refunded").length
+
+    return res.status(200).json({
+      success: true,
+      items,
+      pagination: { page: currentPage, limit, totalItems, totalPages },
+      summary: { totalPayments, successfulPayments, pendingPayments, failedPayments, refundedPayments },
+    })
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to fetch admin payments", error: error.message })
   }
 })
 
