@@ -414,6 +414,73 @@ const renderSubscriptionConfirmedEmail = ({
   `)
 }
 
+// ========================================
+// 7. Email change requested alert (sent to the OLD/current email)
+// ========================================
+const renderEmailChangeAlertEmail = (newEmail, fullName = "") => shell(`
+  <!-- Warning icon -->
+  <table cellpadding="0" cellspacing="0" border="0" role="presentation" style="margin:0 auto 24px;">
+    <tr>
+      <td style="background:#fef3c7;border-radius:50%;width:56px;height:56px;text-align:center;vertical-align:middle;">
+        <p style="margin:0;font-size:28px;line-height:56px;">✉️</p>
+      </td>
+    </tr>
+  </table>
+
+  ${h1("Email change requested")}
+  ${lead(`Hi${fullName ? ` ${fullName}` : ""}, someone requested to change the email address on your VenloRent account. This email is being sent to your <strong>current, verified</strong> address as a security notice.`)}
+
+  <!-- Details row -->
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation"
+         style="background:${B.soft};border:1px solid ${B.border};border-radius:10px;margin:0 0 24px;">
+    <tr>
+      <td style="padding:14px 18px;">
+        <p style="margin:0 0 6px;font-size:13px;color:${B.muted};">
+          Requested new email
+        </p>
+        <p style="margin:0;font-size:14px;font-weight:600;color:${B.dark};">
+          ${newEmail}
+        </p>
+      </td>
+    </tr>
+  </table>
+
+  <!-- Info box: nothing changes yet -->
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation"
+         style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:10px;margin:0 0 24px;">
+    <tr>
+      <td style="padding:14px 18px;">
+        <p style="margin:0;font-size:13px;color:${B.primaryDark};line-height:1.6;">
+          <strong>Nothing has changed yet.</strong><br/>
+          Your current email stays active and your account remains fully accessible until the new address is confirmed with a verification code.
+        </p>
+      </td>
+    </tr>
+  </table>
+
+  <!-- Warning if not you -->
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation"
+         style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;margin:0 0 24px;">
+    <tr>
+      <td style="padding:14px 18px;">
+        <p style="margin:0;font-size:13px;color:#991b1b;line-height:1.6;">
+          <strong>Didn't request this?</strong><br/>
+          Someone may have access to your account. Change your password immediately and contact support.
+          <a href="${B.appUrl}/password-recovery"
+             style="color:#dc2626;font-weight:600;text-decoration:underline;">
+            Reset your password
+          </a>.
+        </p>
+      </td>
+    </tr>
+  </table>
+
+  ${btn("Go to My Account", B.appUrl)}
+
+  ${divider}
+  ${note(`This is a security notice only — no action is required if you made this request. If you need help, contact us via our <a href=${B.helpUrl} style='color:${B.primary};text-decoration:none;'>Help Center</a>.`)}
+`)
+
 module.exports = {
   getResendClient,
   renderOtpEmail,
@@ -422,4 +489,5 @@ module.exports = {
   renderPasswordChangedEmail,
   renderListingOrderedEmail,
   renderSubscriptionConfirmedEmail,
+  renderEmailChangeAlertEmail,
 }

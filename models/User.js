@@ -58,6 +58,18 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    pendingEmail: {
+      type: String, 
+      default: null 
+    },
+    pendingEmailOtp: { 
+      type: String, 
+      default: null 
+    },
+    pendingEmailOtpExpires: { 
+      type: Date, 
+      default: null 
+    },
     otp: {
       type: String,
       default: null,
@@ -66,6 +78,14 @@ const userSchema = new mongoose.Schema(
     otpExpires: {
       type: Date,
       default: null,
+    },
+    otpAttempts: { 
+      type: Number, 
+      default: 0 
+    },
+    otpLockedUntil: { 
+      type: Date, 
+      default: null 
     },
     resetPasswordToken: {
       type: String,
@@ -158,6 +178,15 @@ const userSchema = new mongoose.Schema(
     blockedUsers: {
       type: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
       default: [],
+    },
+    onboarding: {
+      completedAt: Date,
+      intent: String,
+      locations: [String],
+      otherLocation: String,
+      category: String,
+      houseTypes: [String],
+      moveIn: String,
     },
     // Agent payout details are stored separately from the public profile so
     // sellers can update bank information later without re-registering.

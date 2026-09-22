@@ -32,7 +32,8 @@ const adminAuthMiddleware = require("./middleware/adminAuthMiddleware")
 const notify = require("./utility/notify")
 const { expireOverdueOrders, ORDER_WINDOW_HOURS, TERMINAL_ORDER_STATUSES } = require("./utility/orderLifecycle.js")
 const { expireOverdueRequests, isRequestExpired, REQUEST_WINDOW_DAYS } = require("./utility/requestLifecycle.js")
-const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail, renderListingOrderedEmail, renderSubscriptionConfirmedEmail } = require("./emails")
+const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail, renderListingOrderedEmail, renderSubscriptionConfirmedEmail, renderEmailChangeAlertEmail } = require("./emails")
+const { validateEmailThoroughly } = require("./emails/emailValidation")
 const { loginLimiter, otpLimiter, verifyLimiter, registerLimiter, passwordResetLimiter } = require('./utility/rateLimiters')
 const { bachs, verifyBachsSignature, getOrCreateBachsCustomer, getPlanPricing, PLAN_PRODUCTS, PRODUCT_TO_PLAN } = require('./utility/bachs')
 const { cloudinary, avatarUpload, kycUpload, listingUpload } = require("./utility/cloudinary")
@@ -187,7 +188,14 @@ router.get("/", async (req, res) => {
   =========================================*/
 router.post("/auth/register", registerLimiter, async (req, res) => {
   try {
-    const { fullName, email, username, password, role = "regular" } = req.body
+    const { fullName, email, username, password, role = "regular", website } = req.body
+
+    if (website && website.toString().trim() !== "") {
+      return res.status(201).json({
+        success: true,
+        message: "User registered successfully",
+      })
+    }
 
     if (!fullName || !email || !username || !password) {
       return res.status(400).json({ message: "Please fill all required fields" })
@@ -202,8 +210,9 @@ router.post("/auth/register", registerLimiter, async (req, res) => {
 
     if (emailText.length > 50) {
       errors.email = "Email length cannot surpass 50 characters"
-    } else if (!/^\S+@\S+\.\S+$/.test(emailText)) {
-      errors.email = "Invalid email address"
+    } else {
+      const emailCheck = await validateEmailThoroughly(emailText)
+      if (!emailCheck.valid) errors.email = emailCheck.reason
     }
 
     if (fullNameText.length > 30) {
@@ -218,8 +227,8 @@ router.post("/auth/register", registerLimiter, async (req, res) => {
 
     if (passwordText.length < 6) {
       errors.password = "Password must be at least 6 characters"
-    } else if (!/^(?=.*[A-Za-z])(?=.*\d)(?=.*[^A-Za-z0-9]).+$/.test(passwordText)) {
-      errors.password = "Password must contain at least one letter, one number, and one special character"
+    } else if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*(),.?":{}|<>_\-+=~`[\]\\/;'])[^\s]{6,}$/u.test(passwordText)) {
+      errors.password = "Password must contain at least one capital letter, one number, and one special character"
     }
 
     if (Object.keys(errors).length > 0) {
@@ -417,13 +426,42 @@ router.post("/auth/email-verify", verifyLimiter, async (req, res) => {
     const user = await User.findOne({ email: email.toLowerCase().trim() }).select("-password")
     if (!user) return res.status(400).json({ message: "User not found" })
 
-    // Check OTP validity
-    if (user.otp !== otp) return res.status(400).json({ message: "Invalid OTP" })
-    if (Date.now() > user.otpExpires) return res.status(400).json({ message: "OTP expired" })
+    // Block guessing once locked out.
+    if (user.otpLockedUntil && Date.now() < new Date(user.otpLockedUntil).getTime()) {
+      const secondsLeft = Math.ceil((new Date(user.otpLockedUntil).getTime() - Date.now()) / 1000)
+      return res.status(429).json({
+        message: `Too many attempts. Try again in ${secondsLeft}s or request a new code.`,
+      })
+    }
 
+    if (!user.otp || !user.otpExpires || Date.now() > user.otpExpires) {
+      return res.status(400).json({ message: "OTP expired" })
+    }
+
+    if (user.otp !== otp) {
+      user.otpAttempts = (user.otpAttempts || 0) + 1
+
+      // Lock out after 5 wrong guesses — force a resend instead of letting them keep trying.
+      if (user.otpAttempts >= 5) {
+        user.otpLockedUntil = new Date(Date.now() + 15 * 60 * 1000) // 15 min lockout
+        user.otp = null
+        user.otpExpires = null
+        await user.save()
+        return res.status(429).json({
+          message: "Too many incorrect attempts. Please request a new code.",
+        })
+      }
+
+      await user.save()
+      return res.status(400).json({ message: "Invalid OTP" })
+    }
+
+    // Success — reset attempt counters.
     user.emailVerified = true
     user.otp = null
     user.otpExpires = null
+    user.otpAttempts = 0
+    user.otpLockedUntil = null
     await user.save()
 
     // Send welcome email 
@@ -445,15 +483,6 @@ router.post("/auth/email-verify", verifyLimiter, async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: "168h" }
     )
-    //Send a return object
-    // const userResponse = {
-    //   id: user._id,
-    //   fullName: user.fullName,
-    //   email: user.email,
-    //   username: user.username,
-    //   role: user.role,
-    //   createdAt: user.createdAt,
-    // }
     res.json({ success: true, token, user, message: "Email verified successfully!" })
   } catch (err) {
     console.error(err)
@@ -820,91 +849,149 @@ router.post('/auth/password-reset', async (req, res) =>{
     }
    })
 
-router.patch('/edit-account', authMiddleware, avatarUpload.single("avatar"), async (req, res) =>{
-  try{
+router.patch('/edit-account', authMiddleware, avatarUpload.single("avatar"), async (req, res) => {
+  try {
     const { fullName, username, email, phone, bio, country } = req.body
     const userId = req.user?.id
 
-    //Check for errors
     const errors = {}
-    if (!fullName?.trim()) errors.fullName = "Full name is required"
-    if (!username?.trim()) errors.username = "Username is required"
-    else if (!/^@?[a-zA-Z0-9_]+$/.test(username)) errors.username = "Username can only contain letters, numbers, and underscores"
-    if (!email?.trim()) errors.email = "Email is required"
-    else if (!/^\S+@\S+\.\S+$/.test(email)) errors.email = "Invalid email address"
-    if (!phone?.trim()) errors.phone = "Phone number is required"
-    if (!country?.trim()) errors.country = "Country is required"
-    if (bio?.trim().length > 100) errors.bio = "Bio mustn't exceed 100 characters"
+
+    // Only validate fields that were actually sent
+    if (fullName !== undefined && !fullName.trim()) {
+      errors.fullName = "Full name cannot be empty"
+    }
+    if (username !== undefined) {
+      if (!username.trim()) errors.username = "Username cannot be empty"
+      else if (!/^@?[a-zA-Z0-9_]+$/.test(username)) {
+        errors.username = "Username can only contain letters, numbers, and underscores"
+      }
+    }
+    if (email !== undefined) {
+      if (!email.trim()) {
+        errors.email = "Email cannot be empty"
+      } else {
+        const emailCheck = await validateEmailThoroughly(email.trim())
+        if (!emailCheck.valid) errors.email = emailCheck.reason
+      }
+    }
+    if (phone !== undefined && !phone.trim()) errors.phone = "Phone number cannot be empty"
+    if (country !== undefined && !country.trim()) errors.country = "Country cannot be empty"
+    if (bio !== undefined && bio.trim().length > 100) errors.bio = "Bio mustn't exceed 100 characters"
 
     if (Object.keys(errors).length > 0) {
-      // Rollback Cloudinary upload if validation fails
-      if (req.file?.filename) {
-        await cloudinary.uploader.destroy(req.file.filename).catch(() => {});
-      }
-      return res.status(400).json({ message: "Validation failed", errors });
+      if (req.file?.filename) await cloudinary.uploader.destroy(req.file.filename).catch(() => {})
+      return res.status(400).json({ message: "Validation failed", errors })
     }
 
-    // Conflict check (exclude current user) in addition to check-user route check
-    const conflict = await User.findOne({
-      _id: { $ne: userId },
-      $or: [
-        { username: username.toLowerCase() },
-        { email: email.toLowerCase() }
-      ],
-    });
+    // Conflict check — only run against fields that were actually submitted
+    if (username !== undefined || email !== undefined) {
+      const orConditions = []
+      if (username !== undefined) orConditions.push({ username: username.toLowerCase() })
+      if (email !== undefined) orConditions.push({ email: email.toLowerCase().trim() })
 
-    if (conflict) {
-      if (req.file?.filename) {
-        await cloudinary.uploader.destroy(req.file.filename).catch(() => {});
+      const conflict = await User.findOne({ _id: { $ne: userId }, $or: orConditions })
+      if (conflict) {
+        if (req.file?.filename) await cloudinary.uploader.destroy(req.file.filename).catch(() => {})
+        const conflictErrors = {}
+        if (email !== undefined && conflict.email === email.toLowerCase().trim()) {
+          conflictErrors.email = "Email is already taken"
+        }
+        if (username !== undefined && conflict.username === username.toLowerCase()) {
+          conflictErrors.username = "Username is already taken"
+        }
+        return res.status(409).json({ message: "Conflict", errors: conflictErrors })
       }
-      const conflictErrors = {};
-      if (conflict.email === email.toLowerCase())
-        conflictErrors.email = "Email is already taken";
-      if (conflict.username === username.toLowerCase())
-        conflictErrors.username = "Username is already taken";
-      return res.status(409).json({ message: "Conflict", errors: conflictErrors });
     }
 
-    //Create the data object
-    const updateData = { fullName, username, email, phone, bio, country };
+    const currentUser = await User.findById(userId).select("email avatar fullName")
+
+    // Build updateData from only what was sent
+    const updateData = {}
+    if (fullName !== undefined) updateData.fullName = fullName.trim()
+    if (username !== undefined) updateData.username = username.toLowerCase().trim()
+    if (phone !== undefined) updateData.phone = phone.trim()
+    if (bio !== undefined) updateData.bio = bio.trim()
+    if (country !== undefined) updateData.country = country.trim()
+
+    let pendingEmailConfirmation = false
+
+    if (email !== undefined) {
+      const emailChanged = currentUser.email.toLowerCase() !== email.toLowerCase().trim()
+
+      if (emailChanged) {
+        const otp = crypto.randomInt(100000, 999999).toString()
+        updateData.pendingEmail = email.toLowerCase().trim()
+        updateData.pendingEmailOtp = otp
+        updateData.pendingEmailOtpExpires = new Date(Date.now() + 10 * 60 * 1000)
+        pendingEmailConfirmation = true
+
+        const resend = getResendClient()
+        await resend.emails.send({
+          from: process.env.AUTH_EMAIL,
+          to: email.trim(),
+          subject: "Confirm your new email address",
+          html: renderOtpEmail(otp),
+        })
+        await resend.emails.send({
+          from: process.env.AUTH_EMAIL,
+          to: currentUser.email,
+          subject: "Email change requested on your VenloRent account",
+          html: renderEmailChangeAlertEmail(email.trim()),
+        })
+      }
+      // If email === current email, nothing to do — it's already correct, skip silently.
+    }
 
     if (req.file?.path) {
-      // Delete old avatar from Cloudinary before replacing
-      const currentUser = await User.findById(userId).select("avatar");
       if (currentUser?.avatar) {
-        const publicId = currentUser.avatar
-          .split("/")
-          .slice(-2)
-          .join("/")
-          .replace(/\.[^/.]+$/, "");
-        await cloudinary.uploader.destroy(publicId).catch(() => {}); // non-fatal
+        const publicId = currentUser.avatar.split("/").slice(-2).join("/").replace(/\.[^/.]+$/, "")
+        await cloudinary.uploader.destroy(publicId).catch(() => {})
       }
-      updateData.avatar = req.file.path;
+      updateData.avatar = req.file.path
     }
 
-    //Validate required fields
-    const updatedUser = await User.findByIdAndUpdate(
-      userId, 
-      updateData,
-      {
-        new: true,
-        runValidators: true,
-      }).select("-password -otp -otpExpires -resetPasswordToken -resetPasswordExpires")
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ message: "No changes submitted" })
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(userId, updateData, {
+      new: true,
+      runValidators: true,
+    }).select("-password -otp -otpExpires -resetPasswordToken -resetPasswordExpires -pendingEmailOtp")
 
     return res.status(200).json({
-      message: "Account updated successfully",
+      message: pendingEmailConfirmation
+        ? "Account updated. Confirm your new email to complete the change."
+        : "Account updated successfully",
       success: true,
-      user: updatedUser
+      pendingEmailConfirmation,
+      user: updatedUser,
     })
-  }catch(error){
-    if(req.file?.filname){
-      await cloudinary.uploader.destroy(req.file.filename).catch(() =>{})
-    }
-    return res.status(500).json({
-      message: "Failed to edit account",
-      error: error.message,
-    })
+  } catch (error) {
+    if (req.file?.filename) await cloudinary.uploader.destroy(req.file.filename).catch(() => {})
+    return res.status(500).json({ message: "Failed to edit account", error: error.message })
   }
+})
+
+router.post("/confirm-email-change", authMiddleware, async (req, res) => {
+  const { otp } = req.body
+  const user = await User.findById(req.user.id)
+
+  if (!user.pendingEmail || Date.now() > user.pendingEmailOtpExpires) {
+    return res.status(400).json({ message: "No pending email change, or it expired" })
+  }
+  if (user.pendingEmailOtp !== otp) {
+    return res.status(400).json({ message: "Invalid code" })
+  }
+
+  user.email = user.pendingEmail
+  user.emailVerified = true
+  user.pendingEmail = null
+  user.pendingEmailOtp = null
+  user.pendingEmailOtpExpires = null
+  await user.save()
+
+  return res.status(200).json({ success: true, message: "Email updated" })
 })
 
 // Agent-only payout details update.
