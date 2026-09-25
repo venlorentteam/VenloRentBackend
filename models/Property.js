@@ -29,8 +29,13 @@ const propertySchema = new mongoose.Schema(
         property_type: {
             type: String,
             required: true,
-            enum: ["apartment", "flat", "self-con", "duplex", "shop", "conference-room"],
+            enum: ["apartment", "flat", "self-contained", "duplex", "shop", "office", "conference-room", "studio"],
             index: true,
+        },
+        bedrooms: {
+            type: String,
+            enum: ["1", "2", "3", "4+"],
+            default: null,
         },
         amount: {
             type: Number,

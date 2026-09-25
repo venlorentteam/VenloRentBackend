@@ -49,4 +49,10 @@ module.exports = {
     5,    // 5 attempts
     'Too many password reset attempts. Please try again later.'
   ),
+
+ publicLookupLimiter: createLimiter(
+    1,    // 1 minute window
+    5,   // 5 lookups per minute per IP
+    'Too many requests, please slow down'
+  ),
 }

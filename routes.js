@@ -30,6 +30,7 @@ const adminAuthMiddleware = require("./middleware/adminAuthMiddleware")
 
 // Helpers
 const notify = require("./utility/notify")
+const { scoreProperty } = require("./utility/feedScoring")
 const { expireOverdueOrders, ORDER_WINDOW_HOURS, TERMINAL_ORDER_STATUSES } = require("./utility/orderLifecycle.js")
 const { expireOverdueRequests, isRequestExpired, REQUEST_WINDOW_DAYS } = require("./utility/requestLifecycle.js")
 const { getResendClient, renderOtpEmail, renderWelcomeEmail, renderPasswordResetEmail, renderPasswordChangedEmail, renderListingOrderedEmail, renderSubscriptionConfirmedEmail, renderEmailChangeAlertEmail } = require("./emails")
@@ -559,6 +560,13 @@ router.get("/profile", authMiddleware, async (req, res) => {
       return res.status(404).json({ message: "User not found" })
     }
 
+    if (user.pendingEmail && user.pendingEmailOtpExpires && Date.now() > user.pendingEmailOtpExpires) {
+      user.pendingEmail = null
+      user.pendingEmailOtp = null
+      user.pendingEmailOtpExpires = null
+      await user.save()
+    }
+
     const [followersCount, followingCount] = await Promise.all([
       Follow.countDocuments({ following: user._id }),
       Follow.countDocuments({ follower: user._id }),
@@ -975,11 +983,13 @@ router.patch('/edit-account', authMiddleware, avatarUpload.single("avatar"), asy
 
 router.post("/confirm-email-change", authMiddleware, async (req, res) => {
   const { otp } = req.body
-  const user = await User.findById(req.user.id)
+  const user = await User.findById(req.user.id).select("-password -otp -otpExpires")
 
-  if (!user.pendingEmail || Date.now() > user.pendingEmailOtpExpires) {
-    return res.status(400).json({ message: "No pending email change, or it expired" })
+  if (!user.pendingEmail) {
+    return res.status(400).json({ message: "No pending email change" })
   }
+  if (Date.now() > user.pendingEmailOtpExpires) return res.status(400).json({ message: "OTP expired" })
+    
   if (user.pendingEmailOtp !== otp) {
     return res.status(400).json({ message: "Invalid code" })
   }
@@ -992,6 +1002,32 @@ router.post("/confirm-email-change", authMiddleware, async (req, res) => {
   await user.save()
 
   return res.status(200).json({ success: true, message: "Email updated" })
+})
+
+router.post("/resend-email-change-otp", authMiddleware, otpLimiter, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select("pendingEmail")
+    if (!user?.pendingEmail) {
+      return res.status(400).json({ message: "No pending email change found" })
+    }
+
+    const otp = crypto.randomInt(100000, 999999).toString()
+    user.pendingEmailOtp = otp
+    user.pendingEmailOtpExpires = new Date(Date.now() + 10 * 60 * 1000)
+    await user.save()
+
+    const resend = getResendClient()
+    await resend.emails.send({
+      from: process.env.AUTH_EMAIL,
+      to: user.pendingEmail,
+      subject: "Confirm your new email address",
+      html: renderOtpEmail(otp),
+    })
+
+    return res.status(200).json({ success: true, message: "New code sent" })
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to resend code", error: error.message })
+  }
 })
 
 // Agent-only payout details update.
@@ -1303,6 +1339,74 @@ router.post("/auth/kyc/didit-webhook",
     }
   }
 )
+
+router.patch("/onboarding", authMiddleware, async (req, res) => {
+  try {
+    const { onboarding } = req.body
+    if (!onboarding) {
+      return res.status(400).json({ message: "onboarding payload is required" })
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(
+      req.user.id,
+      {
+        onboarding: {
+          ...onboarding,
+          completedAt: new Date(),
+        },
+      },
+      { new: true, runValidators: true }
+    ).select("-password -otp -otpExpires -resetPasswordToken -resetPasswordExpires")
+
+    if (!updatedUser) return res.status(404).json({ message: "User not found" })
+
+    return res.status(200).json({ success: true, user: updatedUser })
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to save onboarding preferences", error: error.message })
+  }
+})
+
+router.get("/feed", authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select("onboarding role")
+    const { page = 1, limit = 20 } = req.query
+    const safeLimit = Math.min(Number(limit) || 20, 50)
+    const safePage = Math.max(Number(page) || 1, 1)
+
+    const baseQuery = {
+      status: "available",
+      $or: [{ moderationStatus: "approved" }, { moderationStatus: { $exists: false } }],
+    }
+
+    // No onboarding data (skipped, or an agent account) — fall back to the plain reverse-chronological feed.
+    if (!user?.onboarding || user.onboarding.skipped || !user.onboarding.category) {
+      const items = await Property.find(baseQuery)
+        .sort({ createdAt: -1 })
+        .skip((safePage - 1) * safeLimit)
+        .limit(safeLimit)
+        .populate("owner", "fullName username avatar kycStatus plan")
+      return res.status(200).json({ success: true, items, personalized: false })
+    }
+
+    // Pull a bounded candidate pool (cap this — don't score your entire listings table every request).
+    const candidates = await Property.find(baseQuery)
+      .sort({ createdAt: -1 })
+      .limit(300) // scoring window — tune based on your actual listing volume
+      .populate("owner", "fullName username avatar kycStatus plan")
+      .lean()
+
+    const scored = candidates
+      .map((property) => ({ property, score: scoreProperty(property, user.onboarding) }))
+      .sort((a, b) => b.score - a.score || new Date(b.property.createdAt) - new Date(a.property.createdAt))
+
+    const start = (safePage - 1) * safeLimit
+    const pageItems = scored.slice(start, start + safeLimit).map((s) => s.property)
+
+    return res.status(200).json({ success: true, items: pageItems, personalized: true })
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to build feed", error: error.message })
+  }
+})
 /*==================================================
   Bachs: Billing and subscription routes
   ==================================================*/
@@ -1544,7 +1648,11 @@ router.post("/create-listing", authMiddleware, listingUploadMiddleware, async (r
     if (title.length > 100) validationErrors.title = "Title cannot exceed 100 characters"
     if (description.length > 1000) validationErrors.description = "Description cannot exceed 1000 characters"
     if (!["rent", "sale", "shortlet"].includes(listing_type)) validationErrors.listing_type = "Invalid listing type"
-    if (!["apartment", "flat", "self-con", "duplex", "shop", "office", "conference-room"].includes(property_type)) validationErrors.property_type = "Invalid property type"
+    //if (!["apartment", "flat", "self-contained", "duplex", "shop", "office", "conference-room"].includes(property_type)) validationErrors.property_type = "Invalid property type"
+    const ALLOWED_PROPERTY_TYPES = Property.schema.path("property_type").enumValues
+    if (!ALLOWED_PROPERTY_TYPES.includes(property_type)) {
+      validationErrors.property_type = "Invalid property type"
+    }
     // Normalize features: accept array, JSON string, or comma-separated string.
     const normalizedFeatures = (() => {
       if (Array.isArray(features)) return features
@@ -1565,7 +1673,7 @@ router.post("/create-listing", authMiddleware, listingUploadMiddleware, async (r
 
     if (normalizedFeatures.length > 10) validationErrors.features = "Maximum 10 features allowed"
     
-    const ALLOWED_BEDROOMS = ["studio", "1", "2", "3", "4+"]
+    const ALLOWED_BEDROOMS = ["1", "2", "3", "4+"]
     const normalizedAmount = Number(amount)
 
     if (normalizedAmount <= 0) validationErrors.amount = "Amount must be greater than zero"
@@ -1636,6 +1744,7 @@ router.post("/create-listing", authMiddleware, listingUploadMiddleware, async (r
       description: description.trim(),
       listing_type,
       property_type,
+      bedrooms,
       amount: normalizedAmount,
       location:{
         town: location.town,
@@ -1768,6 +1877,10 @@ router.get("/properties/:id", async (req, res) => {
 
     if (!property) {
       return res.status(404).json({ message: "Property not found" })
+    }
+
+    if (property.owner.toString() !== req.user.id) {
+      return res.status(403).json({ message: "You can only delete your own listings" })
     }
 
     // Hide non-approved properties from public view, unless moderation field is not yet defined.

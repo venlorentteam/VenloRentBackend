@@ -54,6 +54,45 @@ const userSchema = new mongoose.Schema(
       trim: true,
       default: "Nigeria",
     },
+    onboarding: {
+      searchIntent: {
+        type: String, 
+        enum: ["searching", "exploring", null], 
+        default: null 
+      },
+      locations: { 
+        type: [String], 
+        default: [] 
+      },
+      otherLocation: { 
+        type: String, 
+        default: "" 
+      },
+      category: { 
+        type: String, 
+        default: "" 
+      }, // "Rent" | "Sale" | "Shortlet"
+      propertyTypes: { 
+        type: [String], 
+        default: [] 
+      },
+      bedrooms:{
+        type: [String],
+        default: []
+      },
+      moveIn: { 
+        type: String, 
+        default: "" 
+      },
+      skipped: { 
+        type: Boolean, 
+        default: false 
+      },
+      completedAt: { 
+        type: Date, 
+        default: null 
+      },
+    },
     emailVerified: {
       type: Boolean,
       default: false,
@@ -185,7 +224,8 @@ const userSchema = new mongoose.Schema(
       locations: [String],
       otherLocation: String,
       category: String,
-      houseTypes: [String],
+      propertyTypes: [String],
+      bedrooms: [String],
       moveIn: String,
     },
     // Agent payout details are stored separately from the public profile so
